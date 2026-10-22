@@ -1,0 +1,21 @@
+[package]
+name = "rex-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Modern cross-platform hex editor and binary analysis workstation for Windows and Linux"
+
+[[bin]]
+name = "rexeditor"
+path = "src/main.rs"
+
+[dependencies]
+rex-core = { path = "../rex-core" }
+eframe.workspace = true
+egui.workspace = true
+egui_tiles.workspace = true
+rfd.workspace = true
+arboard.workspace = true
+serde.workspace = true
+serde_json.workspace = true

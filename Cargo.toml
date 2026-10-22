@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rex-core",
+    "crates/rex-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Dylan Nandlall <dylanfirestorm@gmail.com>"]
+license = "MIT"
+
+[workspace.dependencies]
+memmap2 = "0.9"
+memchr = "2.7"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "persistence", "x11", "wayland"] }
+egui = "0.31"
+egui_tiles = "0.12"
+rfd = "0.15"
+arboard = "3.4"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+strip = true

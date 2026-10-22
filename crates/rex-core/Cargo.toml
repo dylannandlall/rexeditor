@@ -1,0 +1,24 @@
+[package]
+name = "rex-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Headless binary editing and analysis engine for rexeditor"
+
+[dependencies]
+memmap2.workspace = true
+memchr.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
