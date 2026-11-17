@@ -12,6 +12,8 @@ pub struct InspectorUiState {
     pub endianness: Endianness,
     pub editing_kind: Option<String>,
     pub edit_buffer: String,
+    /// Set for one frame when an edit starts so the text box grabs keyboard focus.
+    pub focus_edit: bool,
 }
 
 #[derive(Default)]
@@ -61,7 +63,11 @@ fn truncate_display(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Renders one inspector row. `kind` (if `Some`) enables inline editing.
+/// Renders one inspector row.
+///
+/// Clicking the value copies it to the clipboard. When `kind` is `Some`, double-clicking
+/// turns the value into a text box: Enter writes the new value, Esc or clicking away
+/// cancels.
 fn value_row(
     ui: &mut egui::Ui,
     doc: &mut Document,
@@ -72,52 +78,88 @@ fn value_row(
     kind: Option<&str>,
 ) {
     ui.label(label);
-    ui.horizontal(|ui| {
-        let editing = kind.is_some() && state.editing_kind.as_deref() == kind;
-        if editing {
-            let resp =
-                ui.add(egui::TextEdit::singleline(&mut state.edit_buffer).desired_width(110.0));
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let apply = ui.small_button("Apply").clicked() || enter;
-            if ui.small_button("X").clicked() {
-                state.editing_kind = None;
-            } else if apply {
-                if let Some(k) = kind {
-                    match InspectorValue::parse_as(k, &state.edit_buffer, state.endianness) {
-                        Ok(bytes) => doc.overwrite_bytes(range_start, &bytes),
-                        Err(err) => doc.status = err,
-                    }
-                }
-                state.editing_kind = None;
-            }
-        } else {
-            let display = truncate_display(value, 22);
-            let lbl = ui.add(
-                egui::Label::new(egui::RichText::new(&display).monospace()).truncate(),
-            );
-            if display != value {
-                lbl.on_hover_text(value);
-            }
-            if value != "-"
-                && !value.is_empty()
-                && ui
-                    .small_button("📋")
-                    .on_hover_text("Copy value to clipboard")
-                    .clicked()
-                && let Ok(mut cb) = arboard::Clipboard::new()
-            {
-                let _ = cb.set_text(value.to_string());
-                doc.status = format!("Copied {label}: {display}");
-            }
-            if let Some(k) = kind
-                && ui.small_button("Edit").clicked()
-            {
-                state.editing_kind = Some(k.to_string());
-                state.edit_buffer = value.to_string();
-            }
+    let editing = kind.is_some() && state.editing_kind.as_deref() == kind;
+    if editing {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.edit_buffer)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(ui.available_width().max(80.0)),
+        );
+        if std::mem::take(&mut state.focus_edit) {
+            resp.request_focus();
         }
-    });
+        if resp.lost_focus() {
+            let (enter, escape) =
+                ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if enter
+                && !escape
+                && let Some(k) = kind
+            {
+                match InspectorValue::parse_as(k, &state.edit_buffer, state.endianness) {
+                    Ok(bytes) => {
+                        doc.overwrite_bytes(range_start, &bytes);
+                        doc.status = format!("Wrote {label} = {}", state.edit_buffer.trim());
+                    }
+                    Err(err) => doc.status = err,
+                }
+            }
+            state.editing_kind = None;
+        }
+    } else {
+        let copyable = value != "-" && !value.is_empty();
+        let display = truncate_display(value, 22);
+        let resp = copyable_value(ui, &display);
+        let hint = match (copyable, kind.is_some()) {
+            (true, true) => "Click to copy · Double-click to edit",
+            (true, false) => "Click to copy",
+            (false, true) => "Double-click to edit",
+            (false, false) => "",
+        };
+        let resp = if display != value {
+            resp.on_hover_text(format!("{value}\n\n{hint}"))
+        } else if !hint.is_empty() {
+            resp.on_hover_text(hint)
+        } else {
+            resp
+        };
+        if let Some(k) = kind
+            && resp.double_clicked()
+        {
+            state.editing_kind = Some(k.to_string());
+            state.edit_buffer = if copyable { value.to_string() } else { String::new() };
+            state.focus_edit = true;
+        } else if copyable && resp.clicked() {
+            copy_to_clipboard(ui, value);
+            doc.status = format!("Copied {label}: {display}");
+        }
+    }
     ui.end_row();
+}
+
+/// A monospace value that behaves like a read-only text box: it highlights on hover
+/// and reports clicks.
+fn copyable_value(ui: &mut egui::Ui, display: &str) -> egui::Response {
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(display).monospace())
+            .truncate()
+            .sense(Sense::click()),
+    );
+    if resp.hovered() {
+        ui.painter().rect_stroke(
+            resp.rect.expand(2.0),
+            2.0,
+            Stroke::new(1.0_f32, Color32::from_gray(110)),
+            egui::StrokeKind::Outside,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn copy_to_clipboard(ui: &egui::Ui, text: &str) {
+    ui.ctx().copy_text(text.to_string());
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
 }
 
 fn format_numeric(data: &InspectorData, kind: &str, endian: Endianness) -> String {
@@ -284,20 +326,14 @@ pub fn render_inspector_panel(
                                     ui.weak(res);
                                 } else {
                                     let disp = truncate_display(res, 22);
-                                    let lbl = ui.add(
-                                        egui::Label::new(egui::RichText::new(&disp).monospace())
-                                            .truncate(),
-                                    );
-                                    if disp != res {
-                                        lbl.on_hover_text(res);
-                                    }
-                                    if ui
-                                        .small_button("📋")
-                                        .on_hover_text("Copy plugin output")
-                                        .clicked()
-                                        && let Ok(mut cb) = arboard::Clipboard::new()
-                                    {
-                                        let _ = cb.set_text(res.to_string());
+                                    let lbl = copyable_value(ui, &disp);
+                                    let lbl = if disp != res {
+                                        lbl.on_hover_text(format!("{res}\n\nClick to copy"))
+                                    } else {
+                                        lbl.on_hover_text("Click to copy")
+                                    };
+                                    if lbl.clicked() {
+                                        copy_to_clipboard(ui, res);
                                         doc.status = format!("Copied {}: {disp}", p.name);
                                     }
                                 }

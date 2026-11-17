@@ -584,7 +584,15 @@ pub fn render_hex_viewport(
                         }
 
                         // ---- Mouse interaction ----
-                        let pointer = ui.input(|i| i.pointer.interact_pos());
+                        // A drag is only recognized after the pointer moves a few pixels, so
+                        // anchor it where the button went down rather than where it is now.
+                        let pointer = ui.input(|i| {
+                            if resp.drag_started() {
+                                i.pointer.press_origin().or(i.pointer.interact_pos())
+                            } else {
+                                i.pointer.interact_pos()
+                            }
+                        });
                         let (ctrl, shift) =
                             ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
                         if resp.clicked() || resp.drag_started() {
