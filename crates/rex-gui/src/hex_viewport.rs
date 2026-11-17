@@ -576,8 +576,8 @@ pub fn render_hex_viewport(
                         resp.context_menu(|ui| {
                             ui.set_min_width(190.0);
                             for (label, fmt) in [
-                                ("Copy Hex (Ctrl+C)", CopyFormat::HexSpaced),
-                                ("Copy Compact Hex", CopyFormat::HexCompact),
+                                ("Copy Hex (Ctrl+C)", CopyFormat::HexCompact),
+                                ("Copy Hex with Spaces (Ctrl+Alt+C)", CopyFormat::HexSpaced),
                                 ("Copy ASCII (Ctrl+Shift+C)", CopyFormat::Ascii),
                                 ("Copy as C Array", CopyFormat::CArray),
                                 ("Copy as Rust Array", CopyFormat::RustArray),

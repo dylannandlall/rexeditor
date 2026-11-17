@@ -632,7 +632,7 @@ impl RexEditorApp {
     }
 
     fn copy_selection_hex(&mut self, ctx: &Context) {
-        self.copy_selection(ctx, CopyFormat::HexSpaced, "spaced hex");
+        self.copy_selection(ctx, CopyFormat::HexCompact, "hex");
     }
 
     fn paste_clipboard_hex(&mut self, pasted_event: Option<String>) {
@@ -891,6 +891,7 @@ impl RexEditorApp {
         }
 
         let mut copy_hex = false;
+        let mut copy_hex_spaced = false;
         let mut copy_ascii = false;
         let mut paste_hex: Option<Option<String>> = None;
         let mut paste_ascii: Option<Option<String>> = None;
@@ -898,13 +899,18 @@ impl RexEditorApp {
         ctx.input(|i| {
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
             let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
 
             let copy_event = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
-            if (ctrl && !shift && i.key_pressed(Key::C)) || (!shift && copy_event) {
-                copy_hex = true;
-            }
-            if (ctrl && shift && i.key_pressed(Key::C)) || (shift && copy_event) {
-                copy_ascii = true;
+            let copy_pressed = (ctrl && i.key_pressed(Key::C)) || copy_event;
+            if copy_pressed {
+                if alt && !shift {
+                    copy_hex_spaced = true;
+                } else if shift {
+                    copy_ascii = true;
+                } else {
+                    copy_hex = true;
+                }
             }
             let pasted_text = i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(text) => Some(text.clone()),
@@ -928,6 +934,10 @@ impl RexEditorApp {
 
         if copy_hex {
             self.copy_selection_hex(ctx);
+            return;
+        }
+        if copy_hex_spaced {
+            self.copy_selection(ctx, CopyFormat::HexSpaced, "spaced hex");
             return;
         }
         if copy_ascii {
@@ -1229,8 +1239,12 @@ impl eframe::App for RexEditorApp {
                     }
                     ui.separator();
                     for (label, fmt, desc) in [
-                        ("Copy Hex (Ctrl+C)", CopyFormat::HexSpaced, "spaced hex"),
-                        ("Copy Compact Hex", CopyFormat::HexCompact, "compact hex"),
+                        ("Copy Hex (Ctrl+C)", CopyFormat::HexCompact, "hex"),
+                        (
+                            "Copy Hex with Spaces (Ctrl+Alt+C)",
+                            CopyFormat::HexSpaced,
+                            "spaced hex",
+                        ),
                         (
                             "Copy ASCII (Ctrl+Shift+C)",
                             CopyFormat::Ascii,
@@ -2251,7 +2265,8 @@ fn render_help_contents(ui: &mut egui::Ui) {
             ("Delete / Backspace", "Delete selected bytes (in Edit Mode)"),
             ("Ctrl + Z / Ctrl + U", "Undo last byte edit"),
             ("Ctrl + Y / Ctrl + R", "Redo last undone byte edit"),
-            ("Ctrl + C", "Copy selected bytes as spaced hexadecimal to clipboard"),
+            ("Ctrl + C", "Copy selected bytes as hexadecimal with no spaces (A1B2C3)"),
+            ("Ctrl + Alt + C", "Copy selected bytes as spaced hexadecimal (A1 B2 C3)"),
             ("Ctrl + Shift + C", "Copy selected bytes as ASCII text to clipboard"),
             ("Ctrl + V", "Paste hexadecimal bytes from clipboard at cursor"),
             ("Ctrl + Shift + V", "Paste ASCII text from clipboard as raw bytes at cursor"),
