@@ -97,6 +97,33 @@ impl Layout {
     }
 }
 
+/// Which sides of a byte cell lie on the outside of its field's range.
+#[derive(Clone, Copy)]
+struct BorderEdges {
+    top: bool,
+    bottom: bool,
+    left: bool,
+    right: bool,
+}
+
+fn paint_border(painter: &egui::Painter, cell: Rect, edges: BorderEdges, stroke: Stroke) {
+    let inset = stroke.width * 0.5;
+    let (l, r) = (cell.left() + inset, cell.right() - inset);
+    let (t, b) = (cell.top() + inset, cell.bottom() - inset);
+    if edges.top {
+        painter.hline(cell.left()..=cell.right(), t, stroke);
+    }
+    if edges.bottom {
+        painter.hline(cell.left()..=cell.right(), b, stroke);
+    }
+    if edges.left {
+        painter.vline(l, cell.y_range(), stroke);
+    }
+    if edges.right {
+        painter.vline(r, cell.y_range(), stroke);
+    }
+}
+
 fn in_search_match(matches: &[SearchMatch], abs: usize) -> bool {
     let idx = matches.partition_point(|m| m.start <= abs);
     idx > 0 && matches[idx - 1].contains(abs)
@@ -386,10 +413,11 @@ pub fn render_hex_viewport(
                             let byte = row_buf[i];
                             let selected = doc.is_selected(abs);
                             let field = if doc.settings.show_overlays {
-                                doc.fields.iter().find(|f| f.contains(abs))
+                                doc.fields.iter().find(|f| f.visible && f.contains(abs))
                             } else {
                                 None
                             };
+                            let field_text = field.and_then(|f| f.text);
 
                             let bg = if diff_other.is_some_and(|o| o.get(abs) != Some(byte)) {
                                 Some(DIFF_BG)
@@ -397,19 +425,17 @@ pub fn render_hex_viewport(
                                 Some(SELECTION_BG)
                             } else if in_search_match(search_matches, abs) {
                                 Some(SEARCH_BG)
-                            } else if let Some(f) = field {
-                                f.background
-                                    .map(|bg_col| field_color32(bg_col).gamma_multiply(0.35))
-                                    .or_else(|| Some(field_color32(f.color).gamma_multiply(0.14)))
                             } else {
-                                None
+                                field
+                                    .and_then(|f| f.background)
+                                    .map(|c| field_color32(c).gamma_multiply(0.45))
                             };
                             let fg = if selected {
                                 Color32::WHITE
                             } else if doc.buffer.is_modified(abs) {
                                 named_color32(doc.theme.modified)
-                            } else if let Some(f) = field {
-                                field_color32(f.color)
+                            } else if let Some(c) = field_text {
+                                field_color32(c)
                             } else {
                                 byte_color32(&doc.theme, abs, byte, false)
                             };
@@ -429,18 +455,30 @@ pub fn render_hex_viewport(
                                     painter.rect_filled(ascii_rect, 0.0, bg);
                                 }
                             }
-                            if let Some(f) = field {
-                                let stroke = Stroke::new(1.5_f32, field_color32(f.color));
-                                let y = rect.bottom() - 1.0;
-                                painter.hline(hex_rect.x_range(), y, stroke);
-                                if abs == f.start {
-                                    painter.vline(hex_rect.left() + 1.0, rect.y_range(), stroke);
-                                }
-                                if abs == f.end {
-                                    painter.vline(hex_rect.right() - 1.0, rect.y_range(), stroke);
-                                }
+                            if let Some(f) = field
+                                && let Some(border) = f.border
+                            {
+                                let stroke = Stroke::new(1.5_f32, field_color32(border));
+                                let edges = BorderEdges {
+                                    top: abs < bpr || !f.contains(abs - bpr),
+                                    bottom: !f.contains(abs + bpr),
+                                    left: i == 0 || !f.contains(abs - 1),
+                                    right: i + 1 == count || !f.contains(abs + 1),
+                                };
+                                // Extend top/bottom lines across the gap to the next cell
+                                // so a multi-byte border reads as one continuous box.
+                                let hex_span_right = if edges.right {
+                                    hex_rect.right()
+                                } else {
+                                    lay.hex_x(i + 1) - 0.5 * char_w
+                                };
+                                let hex_border = Rect::from_x_y_ranges(
+                                    hex_rect.left()..=hex_span_right,
+                                    rect.y_range(),
+                                );
+                                paint_border(&painter, hex_border, edges, stroke);
                                 if show_ascii {
-                                    painter.hline(ascii_rect.x_range(), y, stroke);
+                                    paint_border(&painter, ascii_rect, edges, stroke);
                                 }
                             }
                             if cursor == Some(abs) {
@@ -490,8 +528,10 @@ pub fn render_hex_viewport(
                                 draw_fg,
                             );
                             if show_ascii {
-                                let afg =
-                                    if selected || doc.buffer.is_modified(abs) || field.is_some() {
+                                let afg = if selected
+                                    || doc.buffer.is_modified(abs)
+                                    || field_text.is_some()
+                                {
                                         fg
                                     } else {
                                         byte_color32(&doc.theme, abs, byte, true)
@@ -516,7 +556,11 @@ pub fn render_hex_viewport(
                             && col < count
                         {
                             let hovered_off = offset + col;
-                            if let Some(f) = doc.fields.iter().find(|f| f.contains(hovered_off)) {
+                            if let Some(f) = doc
+                                .fields
+                                .iter()
+                                .find(|f| f.visible && f.contains(hovered_off))
+                            {
                                 let tip = if f.description.is_empty() {
                                     format!(
                                         "Field: {}\nRange: 0x{:X}..0x{:X} ({} bytes)",

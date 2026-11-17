@@ -22,8 +22,10 @@ pub struct FieldEditorState {
     pub description: String,
     pub start_str: String,
     pub end_str: String,
-    pub color: FieldColor,
+    pub border: Option<FieldColor>,
+    pub text: Option<FieldColor>,
     pub background: Option<FieldColor>,
+    pub visible: bool,
     pub filter: String,
 }
 
@@ -40,6 +42,9 @@ impl FieldEditorState {
             name: format!("field_{}", doc.fields.len() + 1),
             start_str: format!("0x{s:X}"),
             end_str: format!("0x{e:X}"),
+            // Only a border by default; rotate colors so adjacent fields differ.
+            border: Some(FieldColor::ALL[doc.fields.len() % FieldColor::ALL.len()]),
+            visible: true,
             filter,
             ..Default::default()
         };
@@ -304,27 +309,75 @@ pub fn render_inspector_panel(
         });
 }
 
-fn color_selector(ui: &mut egui::Ui, id: &str, current: &mut FieldColor) {
+/// Swatch picker for one optional highlight style; the first swatch means "no color".
+fn color_selector(ui: &mut egui::Ui, id: &str, current: &mut Option<FieldColor>) {
     ui.horizontal_wrapped(|ui| {
         ui.push_id(id, |ui| {
-            for c in FieldColor::ALL {
-                let selected = *current == c;
+            let choices = std::iter::once(None).chain(FieldColor::ALL.into_iter().map(Some));
+            for choice in choices {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                ui.painter().rect_filled(rect, 3.0, field_color32(c));
-                if selected {
-                    ui.painter().rect_stroke(
+                let painter = ui.painter();
+                match choice {
+                    Some(c) => {
+                        painter.rect_filled(rect, 3.0, field_color32(c));
+                    }
+                    None => {
+                        painter.rect_stroke(
+                            rect.shrink(1.0),
+                            3.0,
+                            Stroke::new(1.0_f32, Color32::from_gray(150)),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.line_segment(
+                            [rect.left_bottom() + Vec2::new(3.0, -3.0), rect.right_top() + Vec2::new(-3.0, 3.0)],
+                            Stroke::new(1.5_f32, Color32::from_rgb(230, 90, 90)),
+                        );
+                    }
+                }
+                if *current == choice {
+                    painter.rect_stroke(
                         rect,
                         3.0,
                         Stroke::new(2.0_f32, Color32::WHITE),
                         egui::StrokeKind::Outside,
                     );
                 }
-                if resp.on_hover_text(c.name()).clicked() {
-                    *current = c;
+                let tip = choice.map_or("No color", FieldColor::name);
+                if resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    *current = choice;
                 }
             }
         });
     });
+}
+
+/// Small preview of a field's highlight styles (background, border and text color).
+fn field_swatch(ui: &mut egui::Ui, f: &Field) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 14.0), Sense::hover());
+    let painter = ui.painter();
+    if let Some(bg) = f.background {
+        painter.rect_filled(rect, 2.0, field_color32(bg).gamma_multiply(0.6));
+    }
+    if let Some(border) = f.border {
+        painter.rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.5_f32, field_color32(border)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let text = f.text.map_or(Color32::from_gray(200), field_color32);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "A",
+        egui::FontId::monospace(10.0),
+        text,
+    );
 }
 
 pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut FieldEditorState) {
@@ -344,8 +397,10 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 description: f.description.clone(),
                 start_str: format!("0x{:X}", f.start),
                 end_str: format!("0x{:X}", f.end),
-                color: f.color,
+                border: f.border,
+                text: f.text,
                 background: f.background,
+                visible: f.visible,
                 filter,
             };
         }
@@ -400,6 +455,7 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
 
     let needle = editor.filter.trim().to_ascii_lowercase();
     let mut clicked: Option<usize> = None;
+    let mut visibility_toggled: Option<(usize, bool)> = None;
     egui::ScrollArea::vertical()
         .max_height(if editor.open { 150.0 } else { 220.0 })
         .id_salt("fields_list")
@@ -423,9 +479,21 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 );
                 let resp = ui
                     .horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, field_color32(f.color));
-                        ui.selectable_label(selected, label)
+                        let mut visible = f.visible;
+                        if ui
+                            .checkbox(&mut visible, "")
+                            .on_hover_text("Show or hide this field in the hex view")
+                            .changed()
+                        {
+                            visibility_toggled = Some((idx, visible));
+                        }
+                        field_swatch(ui, f);
+                        let text = if f.visible {
+                            egui::RichText::new(label)
+                        } else {
+                            egui::RichText::new(label).weak()
+                        };
+                        ui.selectable_label(selected, text)
                     })
                     .inner;
                 if !f.description.is_empty() {
@@ -439,6 +507,10 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 ui.weak("No fields defined. Select bytes and click '+ Add Field' (or press 'a').");
             }
         });
+    if let Some((idx, visible)) = visibility_toggled {
+        doc.fields[idx].visible = visible;
+        let _ = doc.persist_automatic_overlay();
+    }
     if let Some(idx) = clicked {
         let (start, end) = (doc.fields[idx].start, doc.fields[idx].end);
         doc.selected_field = idx;
@@ -474,17 +546,12 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 ui.text_edit_singleline(&mut editor.end_str);
                 ui.end_row();
             });
-        ui.label("Foreground Color");
-        color_selector(ui, "fg", &mut editor.color);
-        ui.horizontal(|ui| {
-            let mut has_bg = editor.background.is_some();
-            if ui.checkbox(&mut has_bg, "Background Shading").changed() {
-                editor.background = if has_bg { Some(editor.color) } else { None };
-            }
-        });
-        if let Some(bg) = &mut editor.background {
-            color_selector(ui, "bg", bg);
-        }
+        ui.label("Border Color");
+        color_selector(ui, "border", &mut editor.border);
+        ui.label("Text Color");
+        color_selector(ui, "text", &mut editor.text);
+        ui.label("Background Color");
+        color_selector(ui, "background", &mut editor.background);
         let parsed = Document::parse_offset(&editor.start_str)
             .ok()
             .zip(Document::parse_offset(&editor.end_str).ok());
@@ -498,8 +565,10 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                     description: editor.description.clone(),
                     start: start.min(end),
                     end: start.max(end),
-                    color: editor.color,
+                    border: editor.border,
+                    text: editor.text,
                     background: editor.background,
+                    visible: editor.visible,
                 };
                 match editor.editing_index {
                     Some(i) => doc.update_field(i, field),
