@@ -8,6 +8,7 @@ use std::{
 };
 
 use egui::{Color32, Context, Key, RichText};
+use crate::cli::{LaunchOptions, apply_offset_with_bounds_notice};
 use rex_core::{
     ByteColorMode, CopyFormat, Document, EditKind, SearchMatch, Selection,
     entropy::{self, EntropyMessage, EntropyReport, EntropyWorker},
@@ -289,39 +290,6 @@ impl DocumentTab {
     }
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct LaunchOptions {
-    pub paths: Vec<PathBuf>,
-    pub initial_offset: Option<usize>,
-    pub cli_error: Option<String>,
-}
-
-pub fn apply_offset_with_bounds_notice(doc: &mut Document, offset: usize) -> Option<String> {
-    let len = doc.buffer.len();
-    if len == 0 {
-        let msg = format!(
-            "Offset 0x{offset:X} ({offset}) does not exist because '{}' is empty (0 bytes).",
-            doc.file_name()
-        );
-        doc.status = msg.clone();
-        return Some(msg);
-    }
-    if offset >= len {
-        let last = len - 1;
-        doc.select_offset(last, false);
-        let msg = format!(
-            "Offset 0x{offset:X} ({offset}) does not exist in '{}' (file size is {len} bytes / 0x{len:X}); jumped to end of file (0x{last:X}).",
-            doc.file_name()
-        );
-        doc.status = msg.clone();
-        Some(msg)
-    } else {
-        doc.select_offset(offset, false);
-        doc.status = format!("Jumped to offset 0x{offset:X} ({offset})");
-        None
-    }
-}
-
 pub struct RexEditorApp {
     pub tabs: Vec<DocumentTab>,
     pub active_tab: usize,
@@ -346,8 +314,7 @@ impl RexEditorApp {
     pub fn new(initial_paths: Vec<PathBuf>) -> Self {
         Self::new_with_options(LaunchOptions {
             paths: initial_paths,
-            initial_offset: None,
-            cli_error: None,
+            ..Default::default()
         })
     }
 
