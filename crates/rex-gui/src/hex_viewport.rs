@@ -306,13 +306,16 @@ pub fn render_hex_viewport(
     }
 
     let pending_insert = doc.pending_insert_nibble();
+    // Set while a drag-selection started in this viewport is in progress. The drag is
+    // tracked at the viewport level (not per row) so it survives the starting row
+    // scrolling out of view during edge auto-scroll.
+    let drag_id = egui::Id::new((viewport_id, "drag_select"));
 
-    scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+    let output = scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
             let row_clip = ui.clip_rect().intersect(pane_clip);
             ui.set_clip_rect(row_clip);
             doc.visible_rows = row_range.len().max(1);
             doc.scroll = row_range.start;
-            let buf_len = doc.buffer.len();
 
             for row in row_range {
                 match doc.display_row(row) {
@@ -558,18 +561,9 @@ pub fn render_hex_viewport(
                                 } else {
                                     doc.select_offset(clicked, shift);
                                 }
-                            }
-                        } else if resp.dragged()
-                            && let Some(pos) = pointer
-                        {
-                            let (col, _) = lay.hit_test_clamped(pos.x, *active_column);
-                            let row_delta = ((pos.y - rect.top()) / row_height).floor() as isize;
-                            let target =
-                                offset as isize + row_delta * bpr as isize + col as isize;
-                            let max = buf_len.saturating_sub(1) as isize;
-                            let dragged = target.clamp(0, max) as usize;
-                            if let Some(sel) = &mut doc.selection {
-                                sel.cursor = dragged;
+                                if resp.drag_started() && !ctrl {
+                                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, true));
+                                }
                             }
                         }
 
@@ -625,4 +619,92 @@ pub fn render_hex_viewport(
                 }
             }
         });
+
+    update_drag_selection(
+        ui,
+        doc,
+        &output,
+        drag_id,
+        Layout {
+            left: output.inner_rect.left() - output.state.offset.x,
+            ..header_layout
+        },
+        row_height,
+        total_rows,
+        *active_column,
+    );
+}
+
+/// Extends an in-progress drag selection to the byte under the pointer and auto-scrolls
+/// the viewport when the pointer is held near (or beyond) its top or bottom edge.
+#[allow(clippy::too_many_arguments)]
+fn update_drag_selection(
+    ui: &egui::Ui,
+    doc: &mut Document,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+    drag_id: egui::Id,
+    lay: Layout,
+    row_height: f32,
+    total_rows: usize,
+    active_column: EditColumn,
+) {
+    let ctx = ui.ctx();
+    if !ctx.data(|d| d.get_temp::<bool>(drag_id)).unwrap_or(false) {
+        return;
+    }
+    let (primary_down, pointer, dt) =
+        ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos(), i.stable_dt));
+    if !primary_down {
+        ctx.data_mut(|d| d.remove::<bool>(drag_id));
+        return;
+    }
+    let Some(pos) = pointer else {
+        return;
+    };
+    if total_rows == 0 || doc.buffer.is_empty() {
+        return;
+    }
+
+    let inner = output.inner_rect;
+    let mut state = output.state;
+
+    // Edge auto-scroll: speed grows with how far into (or past) the edge zone the pointer is.
+    let edge = (row_height * 1.5).min(inner.height() * 0.25).max(1.0);
+    let depth = if pos.y < inner.top() + edge {
+        pos.y - (inner.top() + edge)
+    } else if pos.y > inner.bottom() - edge {
+        pos.y - (inner.bottom() - edge)
+    } else {
+        0.0
+    };
+    let mut lay = lay;
+    if depth != 0.0 {
+        let rows_per_sec = (depth / edge * 10.0).clamp(-80.0, 80.0);
+        let delta = rows_per_sec * row_height * dt.clamp(0.0, 0.1);
+        let max_offset = (output.content_size.y - inner.height()).max(0.0);
+        let new_offset = (state.offset.y + delta).clamp(0.0, max_offset);
+        if new_offset != state.offset.y {
+            state.offset.y = new_offset;
+            state.store(ctx, output.id);
+        }
+        // Keep frames coming while the pointer rests in the edge zone.
+        ctx.request_repaint();
+    }
+    lay.left = inner.left() - state.offset.x;
+
+    let y = pos.y.clamp(inner.top(), (inner.bottom() - 1.0).max(inner.top()));
+    let row = (((y - inner.top() + state.offset.y) / row_height).floor().max(0.0) as usize)
+        .min(total_rows - 1);
+    let (col, _) = lay.hit_test_clamped(pos.x, active_column);
+    let target = match doc.display_row(row) {
+        DisplayRow::Bytes { offset } => offset + col,
+        DisplayRow::Repeated { start, .. } => start,
+    };
+    let target = target.min(doc.buffer.len() - 1);
+    if let Some(sel) = &mut doc.selection
+        && sel.cursor != target
+    {
+        sel.cursor = target;
+        ctx.request_repaint();
+    }
 }
