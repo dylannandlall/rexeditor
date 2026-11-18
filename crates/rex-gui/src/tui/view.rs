@@ -529,6 +529,40 @@ fn numeric(data: &InspectorData, kind: &str, endian: Endianness) -> String {
     v.unwrap_or_else(|| "-".into())
 }
 
+/// Most bytes shown in the Binary rows: enough for every numeric type (u64/f64).
+const BINARY_MAX_BYTES: usize = 8;
+
+/// Bits of the selected bytes (`bytes` starts at the selection), one `01000001` group
+/// per byte, wrapped so no byte is split across lines. Selections longer than
+/// `BINARY_MAX_BYTES` end with `…`.
+fn binary_lines(bytes: &[u8], width: usize) -> Vec<String> {
+    if bytes.is_empty() {
+        return vec!["-".into()];
+    }
+    let shown = &bytes[..bytes.len().min(BINARY_MAX_BYTES)];
+    let per_line = ((width + 1) / 9).max(1);
+    let mut lines: Vec<String> = shown
+        .chunks(per_line)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|b| format!("{b:08b}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    if bytes.len() > shown.len()
+        && let Some(last) = lines.last_mut()
+    {
+        if last.chars().count() + 2 <= width {
+            last.push_str(" …");
+        } else {
+            lines.push("…".into());
+        }
+    }
+    lines
+}
+
 fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -547,6 +581,9 @@ fn render_panel(frame: &mut Frame, app: &App, tab: &Tab, area: Rect) -> super::F
         Endianness::Big => "BE",
     };
 
+    let label_w = 10usize;
+    let value_w = (area.width as usize).saturating_sub(label_w + 3);
+
     let mut rows: Vec<(&str, String)> = vec![
         (
             "Range",
@@ -554,9 +591,15 @@ fn render_panel(frame: &mut Frame, app: &App, tab: &Tab, area: Rect) -> super::F
         ),
         ("Length", format!("{} bytes", data.selection_len)),
         ("Hex", data.hex_preview.clone()),
+    ];
+    let selected = &window[..window.len().min(data.selection_len)];
+    for (i, line) in binary_lines(selected, value_w).into_iter().enumerate() {
+        rows.push((if i == 0 { "Binary" } else { "" }, line));
+    }
+    rows.extend([
         ("ASCII", data.ascii_preview.clone()),
         ("UTF-8", data.utf8_preview.clone()),
-    ];
+    ]);
     for kind in [
         "u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64",
     ] {
@@ -588,8 +631,6 @@ fn render_panel(frame: &mut Frame, app: &App, tab: &Tab, area: Rect) -> super::F
     let insp_area = Rect::new(area.x, area.y, area.width, insp_h);
     let fields_area = Rect::new(area.x, area.y + insp_h, area.width, fields_h);
 
-    let label_w = 10usize;
-    let value_w = (insp_area.width as usize).saturating_sub(label_w + 3);
     let lines: Vec<Line> = rows
         .iter()
         .map(|(label, value)| {
@@ -1117,6 +1158,67 @@ mod tests {
             let mut empty = App::new(LaunchOptions::default());
             draw(&mut empty, w, h);
         }
+    }
+
+    #[test]
+    fn binary_lines_wrap_whole_bytes() {
+        assert_eq!(binary_lines(&[0x41], 30), vec!["01000001"]);
+        assert_eq!(binary_lines(&[], 30), vec!["-"]);
+        // 26 columns fit three bytes ("xxxxxxxx " x 3 minus the trailing space).
+        assert_eq!(
+            binary_lines(&[0x00, 0xFF, 0x0F, 0xF0], 26),
+            vec!["00000000 11111111 00001111", "11110000"]
+        );
+        // Never splits a byte, even when narrower than one group.
+        assert_eq!(binary_lines(&[1, 2], 4), vec!["00000001", "00000010"]);
+        // At most eight bytes, then an ellipsis.
+        let lines = binary_lines(&[0xAA; 12], 35);
+        assert_eq!(
+            lines,
+            vec![
+                "10101010 10101010 10101010 10101010",
+                "10101010 10101010 10101010 10101010",
+                "…",
+            ]
+        );
+        assert_eq!(
+            binary_lines(&[0xAA; 9], 80),
+            vec![format!("{} …", vec!["10101010"; 8].join(" "))]
+        );
+    }
+
+    fn screen_text(buf: &Buffer) -> Vec<String> {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inspector_shows_bits_of_the_selection() {
+        let mut app = app_with(vec![0x00, 0x41, 0xF0, 0x0F, 0xFF, 0, 0, 0]);
+        let doc = &mut app.tabs[0].doc;
+        doc.select_offset(1, false);
+        let buf = draw(&mut app, 130, 34);
+        let screen = screen_text(&buf);
+        assert!(
+            screen.iter().any(|l| l.contains("Binary    01000001 ")),
+            "single byte"
+        );
+
+        let doc = &mut app.tabs[0].doc;
+        doc.select_offset(1, false);
+        doc.select_offset(4, true);
+        let buf = draw(&mut app, 130, 34);
+        let text = screen_text(&buf).join("\n");
+        assert!(text.contains("01000001 11110000 00001111"), "{text}");
+        assert!(
+            text.contains("11111111"),
+            "wrapped onto a continuation line"
+        );
     }
 
     #[test]
