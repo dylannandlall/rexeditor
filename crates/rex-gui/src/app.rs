@@ -318,6 +318,8 @@ pub struct RexEditorApp {
     pub discovered_plugins: Vec<Plugin>,
     pub status_banner: String,
     style_initialized: bool,
+    /// Modifier keys held at the end of the previous frame (see `copy_shortcut_format`).
+    prev_modifiers: egui::Modifiers,
 }
 
 impl RexEditorApp {
@@ -380,6 +382,7 @@ impl RexEditorApp {
             discovered_plugins: plugins::discover(&plugins::default_directory()),
             status_banner,
             style_initialized: false,
+            prev_modifiers: egui::Modifiers::NONE,
         }
     }
 
@@ -602,10 +605,7 @@ impl RexEditorApp {
             return;
         };
         let count = tab.doc.selected_bytes().len();
-        ctx.copy_text(out.clone());
-        if let Ok(mut cb) = arboard::Clipboard::new() {
-            let _ = cb.set_text(out);
-        }
+        crate::clipboard::copy(ctx, out);
         tab.doc.status = format!("Copied {count} byte(s) as {label}");
     }
 
@@ -620,11 +620,7 @@ impl RexEditorApp {
         if !tab.doc.edit_mode {
             tab.doc.edit_mode = true;
         }
-        let text = pasted_event.or_else(|| {
-            arboard::Clipboard::new()
-                .ok()
-                .and_then(|mut cb| cb.get_text().ok())
-        });
+        let text = pasted_event.or_else(crate::clipboard::read_text);
         if let Some(text) = text {
             tab.doc.paste_hex_bytes(&text);
         }
@@ -637,11 +633,7 @@ impl RexEditorApp {
         if !tab.doc.edit_mode {
             tab.doc.edit_mode = true;
         }
-        let text = pasted_event.or_else(|| {
-            arboard::Clipboard::new()
-                .ok()
-                .and_then(|mut cb| cb.get_text().ok())
-        });
+        let text = pasted_event.or_else(crate::clipboard::read_text);
         if let Some(text) = text {
             tab.doc.paste_ascii_bytes(&text);
         }
@@ -868,6 +860,7 @@ impl RexEditorApp {
             return;
         }
 
+        let prev = self.prev_modifiers;
         let mut copy_hex = false;
         let mut copy_hex_spaced = false;
         let mut copy_ascii = false;
@@ -881,7 +874,10 @@ impl RexEditorApp {
 
             let copy_event = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             let copy_pressed = (ctrl && i.key_pressed(Key::C)) || copy_event;
-            match copy_shortcut_format(copy_pressed, shift, alt) {
+            // egui's Copy event carries no modifiers and `i.modifiers` is the state at the
+            // end of the frame, so a quick Ctrl+Alt+C / Ctrl+Shift+C can show Alt or Shift
+            // already released. Keys still held at the end of the previous frame count too.
+            match copy_shortcut_format(copy_pressed, shift || prev.shift, alt || prev.alt) {
                 Some(CopyFormat::HexCompact) => copy_hex = true,
                 Some(CopyFormat::HexSpaced) => copy_hex_spaced = true,
                 Some(CopyFormat::Ascii) => copy_ascii = true,
@@ -1137,6 +1133,7 @@ impl eframe::App for RexEditorApp {
         }
 
         self.handle_keyboard_shortcuts(ctx);
+        self.prev_modifiers = ctx.input(|i| i.modifiers);
 
         // ---- Top Menu & Workstation Toolbar ----
         egui::TopBottomPanel::top("top_menu_bar").show(ctx, |ui| {

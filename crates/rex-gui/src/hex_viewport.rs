@@ -639,10 +639,7 @@ pub fn render_hex_viewport(
                             ] {
                                 if ui.button(label).clicked() {
                                     if let Some(text) = doc.format_selected_bytes(fmt) {
-                                        ui.ctx().copy_text(text.clone());
-                                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                                            let _ = cb.set_text(text);
-                                        }
+                                        crate::clipboard::copy(ui.ctx(), text);
                                         doc.status = format!("Copied selection ({label})");
                                     }
                                     ui.close_menu();
@@ -650,17 +647,13 @@ pub fn render_hex_viewport(
                             }
                             ui.separator();
                             if ui.button("Paste Hex (Ctrl+V)").clicked() {
-                                if let Ok(mut cb) = arboard::Clipboard::new()
-                                    && let Ok(text) = cb.get_text()
-                                {
+                                if let Some(text) = crate::clipboard::read_text() {
                                     doc.paste_hex_bytes(&text);
                                 }
                                 ui.close_menu();
                             }
                             if ui.button("Paste ASCII (Ctrl+Shift+V)").clicked() {
-                                if let Ok(mut cb) = arboard::Clipboard::new()
-                                    && let Ok(text) = cb.get_text()
-                                {
+                                if let Some(text) = crate::clipboard::read_text() {
                                     doc.paste_ascii_bytes(&text);
                                 }
                                 ui.close_menu();
