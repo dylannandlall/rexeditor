@@ -1,127 +1,148 @@
-# RexEditor — Cross-Platform Binary Analysis Workstation
+# RexEditor — Hex Viewer & Editor
 
-`rexeditor` is a high-performance Windows & Linux (Kali 2025.3) desktop hex editor and binary analysis workstation evolved from [`rexedit`](https://github.com/dylannandlall/rexedit).
+`rexeditor` is a fast, cross-platform hex viewer and editor for Windows and Linux, with both a
+desktop GUI and a terminal UI. It is built for inspecting and patching binaries: it opens
+multi-gigabyte files instantly, searches them in the background, decodes selections into
+common data types, and lets you annotate regions of a file with colored overlay fields.
 
-It separates a UI-agnostic Rust binary engine (`crates/rex-core`) from the hardware-accelerated desktop workstation frontend (`crates/rex-gui`), making it fast on older/lower-end hardware while scaling effortlessly to multi-gigabyte binaries without loading entire files into RAM.
+Under the hood, a UI-agnostic Rust engine (`crates/rex-core`) drives both front ends
+(`crates/rex-gui`), so the GUI and the terminal UI behave the same way and share overlay files.
 
 ---
 
-## Workspace Architecture
+## Features
 
-```text
-rexeditor/
-├── Cargo.toml                   # Workspace manifest
-└── crates/
-    ├── rex-core/                # Headless binary engine (UI-agnostic, TUI & GUI ready)
-    │   └── src/
-    │       ├── lib.rs
-    │       ├── buffer.rs        # Read-only memmap2::Mmap base + in-memory PieceTable
-    │       ├── document.rs      # O(1) virtual row projection, Undo/Redo, Overlays, Atomic Save
-    │       ├── model.rs         # Selection, Field, Overlay, Theme, 8 ByteColorModes
-    │       ├── inspector.rs     # LE/BE integer, float, LEB128, UTF-8/UTF-16LE, Unix time decoder/encoder
-    │       ├── search.rs        # SIMD (memchr::memmem) + masked wildcard + regex background search
-    │       ├── entropy.rs       # 256-bucket Shannon entropy & byte frequency histogram worker
-    │       ├── plugins.rs       # External script/executable inspector plugin runner
-    │       └── python.rs        # Persistent Python 3 analysis REPL bridge
-    │
-    └── rex-gui/                 # `rexeditor` binary: desktop GUI (eframe / egui) + terminal UI (ratatui)
-        └── src/
-            ├── main.rs          # Entry point: picks GUI or TUI, Windows console handling
-            ├── cli.rs           # Command-line parsing shared by both front ends
-            ├── app.rs           # [gui] Multi-tab workspace, menus, shortcuts, Search/Python docks
-            ├── hex_viewport.rs  # [gui] Virtualized single-pass painter Hex + ASCII viewport
-            ├── sidebar.rs       # [gui] Data Inspector, Field Editor, and Entropy plot
-            ├── theme.rs         # [gui] Zero-allocation hex lookup tables & workstation styling
-            ├── win_console.rs   # Windows console attach/alloc for --help and --tui
-            └── tui/             # [tui] Terminal UI (`rexeditor --tui`)
-                ├── mod.rs       # State, key/mouse handling, prompts
-                └── view.rs      # Hex view, inspector, field list, help rendering
+### Viewing and editing
+- **Hex + ASCII view** with configurable bytes per row and eight byte-coloring modes (plain,
+  alternating, byte class, high/low nibble, zero bytes, printable, value bands).
+- **Overwrite and insert editing** directly in the hex or ASCII column, with full undo/redo.
+- **Atomic saves**, so an interrupted write can't leave a half-written file.
+- **Multi-tab workspace**, plus **split view** and **diff view** for comparing two files (GUI).
+- **Compress repeated rows** to collapse long runs of identical data.
+- **Jump to offset** in decimal or `0x` hex, and open a file at an offset from the command line.
+
+### Large files
+- Files of 4 MiB or more are memory-mapped read-only instead of being read into RAM, so
+  multi-gigabyte files open instantly and stay light on memory.
+- Edits live in an in-memory piece table, so inserting or deleting bytes never shifts or copies
+  the underlying file, and modified bytes are tracked without rescanning the file.
+- Rows are computed on demand, so scrolling cost doesn't grow with file size.
+- The GUI is event-driven and sits at 0% CPU when idle.
+
+### Search
+- Runs in the background and streams results, so the UI never blocks.
+- Query formats: hex (`DE AD BE EF`), hex with wildcards (`DE ?? BE`), text (`text:`),
+  case-insensitive text (`itext:`), UTF-16LE (`utf16le:`), decimal (`dec:`), binary (`bin:`),
+  fixed-width integers such as `u32le:123`, and regular expressions (`re:[A-Z]+`).
+- SIMD-accelerated literal matching for fast scans of large files.
+
+### Data Inspector
+- Decodes the selection as little- and big-endian integers, floats, LEB128, UTF-8, UTF-16LE and
+  Unix timestamps.
+- Click a value to copy it; double-click to edit it in place and write the bytes back.
+- **Inspector plugins:** drop an executable script into the plugin directory and it adds a row
+  to the Inspector. The selected bytes are sent on stdin, and the first line of stdout becomes
+  the value.
+
+### Overlay fields
+- Annotate byte ranges with named fields, each with its own border, text and background color
+  and a visibility toggle.
+- Overlays are saved to JSON files outside the binary and restored automatically when you
+  reopen the file, so annotations never modify the file you are analysing.
+
+### Analysis tools (GUI)
+- **Entropy view:** Shannon entropy plot and byte-frequency histogram, computed in the background.
+- **Python console:** a persistent Python 3 REPL for scripting against the open file.
+
+### Terminal UI
+Run `rexeditor --tui [FILEPATH]...` to use the editor inside a terminal, with no X11, Wayland or
+OpenGL required, so it works over SSH and on server installs. A build that includes the GUI also
+falls back to the terminal UI on Linux when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set.
+
+The terminal UI shares the engine and overlay files with the GUI:
+
+- Hex/ASCII view with overwrite and insert editing and undo/redo.
+- Search (`/`, then `n`/`N`), jump to offset (`:`), Data Inspector, and overlay fields.
+- Mouse clicks, drag-selection and wheel scrolling in terminals that support them.
+- Copy (`y` / `Ctrl+C`) through the terminal clipboard (OSC 52), which also works over SSH.
+- Shell-style Tab path completion in the Open (`Ctrl+O`) and Save-as prompts.
+- Bytes per row fit the terminal width (16 by default) and can be changed manually.
+
+Press `?` inside the TUI for every keybinding. The entropy view, Python console, inspector
+plugins and split/diff view are GUI-only for now.
+
+---
+
+## Building
+
+You need a recent stable Rust toolchain (the workspace uses the 2024 edition).
+
+```bash
+cargo test --workspace
+cargo build --release --bin rexeditor
 ```
 
----
+### Running
 
-## Key Engine Optimizations over `rexedit`
+```bash
+./target/release/rexeditor [--tui] [FILEPATH]... [-o|--offset <0xHEX_OR_DEC>]
+```
 
-1. **`memmap2` + Piece Table (`ByteBuffer`):**
-   - Files $\ge 4\text{ MiB}$ are memory-mapped read-only via the OS page cache rather than eagerly read and duplicated into `Vec<u8>`.
-   - Overwrites, insertions, and deletions operate on an in-memory piece table (`Vec<Piece>` + append-only edit buffer) without shifting or cloning the underlying file buffer.
-2. **$O(1)$ Uncompressed Row Projection:**
-   - Uncompressed rows are calculated on the fly (`offset = row * bytes_per_row`) without allocating a `Vec<DisplayRow>` per row across multi-GB files.
-   - `collapsed_rows` is only populated when **Compress Repeated Rows** is toggled on.
-3. **Instant Piece-Table Dirty Tracking:**
-   - Modified bytes are identified directly from `PieceSource::Added` spans in $O(\log P)$ time rather than scanning `0..bytes.len()` after each keystroke.
-4. **SIMD-Accelerated Streaming Search:**
-   - Literal hex (`DE AD BE EF`), decimal (`dec:`), binary (`bin:`), ASCII/UTF-8 (`text:`), and UTF-16LE (`utf16:`) queries use `memchr::memmem::Finder`, while wildcard hex queries (`DE ?? BE`) use `memchr` anchor scanning.
-5. **Reactive Event-Driven GUI:**
-   - The GUI sleeps at 0% CPU when idle and only requests periodic repaints while a background search, entropy scan, or Python command is actively streaming results.
+On Windows the binary is `.\target\release\rexeditor.exe`, with the same options.
 
----
+### Linux
 
-## Terminal UI (`--tui`)
+`rexeditor` loads X11, Wayland and OpenGL at runtime, uses pure-Rust XDG Desktop Portals for file
+dialogs, and handles the clipboard in pure Rust. **No `-dev` C header packages (such as
+`libgtk-3-dev` or `libx11-dev`) are needed to build it.** At runtime the GUI needs a working X11
+or Wayland session with OpenGL; the terminal UI needs only a terminal.
 
-`rexeditor --tui [FILEPATH]...` runs the editor inside the terminal: no graphical display, X11 or
-Wayland needed. It works over SSH and on server installs. A build that includes the GUI also falls
-back to the terminal UI automatically on Linux when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set.
+### Terminal-only build
 
-The terminal UI uses the same engine and overlay files as the GUI: hex/ASCII view, overwrite and
-insert editing with undo/redo, search (`/`), jump to offset (`:`), the Data Inspector, and overlay
-fields (show/hide plus border, text and background colors). Mouse clicks, drag-selection and the
-wheel work in terminals with mouse support. Copying (`y` / `Ctrl+C`) goes through the terminal's
-clipboard (OSC 52), so it also works over SSH. Press `?` inside the TUI for all keybindings.
-
-Entropy view, Python console, inspector plugins and split/diff view remain GUI-only for now.
-
-### TUI-only build
-
-To build without any GUI dependencies (eframe, winit, OpenGL, X11/Wayland), e.g. for a
-server or minimal Linux install:
+To build without any GUI dependencies (eframe, winit, OpenGL, X11/Wayland), for example for a
+server or minimal install:
 
 ```bash
 cargo build --release -p rex-gui --no-default-features --features tui
 ./target/release/rexeditor [FILEPATH]
 ```
 
-The binary starts the terminal UI directly. The Cargo features are `gui` and `tui` (both on by
-default); `--no-default-features --features gui` builds the GUI alone.
+This binary starts the terminal UI directly. The Cargo features are `gui` and `tui`, both on by
+default; `--no-default-features --features gui` builds the GUI alone.
 
-On Windows, release builds that include the GUI open the terminal UI in a new console window,
-because Windows shells don't wait for GUI-subsystem programs and would compete for keyboard
-input. Build the TUI-only binary to run it inside an existing terminal.
+### Windows notes
+
+Release builds that include the GUI open the terminal UI in a new console window, because Windows
+shells don't wait for GUI-subsystem programs and would compete for keyboard input. Build the
+terminal-only binary to run the TUI inside an existing terminal.
 
 ---
 
-## Building and Running
+## Project layout
 
-### Windows
-```powershell
-cd C:\Users\dylan\Code\rexeditor
-cargo test --workspace
-cargo build --release --bin rexeditor
-.\target\release\rexeditor.exe [--tui] [FILEPATH] [-o|--offset <0xHEX_OR_DEC>]
+```text
+rexeditor/
+├── Cargo.toml                   # Workspace manifest
+└── crates/
+    ├── rex-core/                # Headless binary engine (shared by GUI and TUI)
+    │   └── src/
+    │       ├── buffer.rs        # Memory-mapped base + in-memory piece table
+    │       ├── document.rs      # Row projection, undo/redo, overlays, atomic save
+    │       ├── model.rs         # Selection, fields, overlays, theme, byte color modes
+    │       ├── inspector.rs     # Integer, float, LEB128, UTF-8/16, timestamp decoding
+    │       ├── search.rs        # Background literal, wildcard and regex search
+    │       ├── entropy.rs       # Entropy and byte-frequency worker
+    │       ├── plugins.rs       # External-script inspector plugins
+    │       └── python.rs        # Persistent Python 3 REPL bridge
+    │
+    └── rex-gui/                 # `rexeditor` binary
+        └── src/
+            ├── main.rs          # Entry point: picks GUI or TUI
+            ├── cli.rs           # Command-line parsing shared by both front ends
+            ├── app.rs           # [gui] Tabs, menus, shortcuts, search and Python docks
+            ├── hex_viewport.rs  # [gui] Virtualized hex + ASCII painter
+            ├── sidebar.rs       # [gui] Data Inspector, field editor, entropy plot
+            ├── theme.rs         # [gui] Styling and hex lookup tables
+            ├── win_console.rs   # Windows console handling for --help and --tui
+            └── tui/             # [tui] Terminal UI (mod.rs: state and input, view.rs: rendering)
 ```
-
-### Linux / Kali Linux 2025.3 (Online & Air-Gapped Offline)
-`rexeditor` uses runtime `dlopen` for X11/Wayland/OpenGL (`winit`/`glutin`), pure-Rust XDG Desktop Portals (`rfd`/`ashpd`), and pure-Rust X11/Wayland clipboard handling (`arboard`), so **no `-dev` C header packages (`libgtk-3-dev`, `libx11-dev`, etc.) are required**.
-
-- **Online Linux build:**
-  ```bash
-  cargo build --release --bin rexeditor
-  ./target/release/rexeditor [--tui] [FILEPATH] [-o|--offset <0xHEX_OR_DEC>]
-  ```
-- **Air-Gapped / Offline Kali 2025.3 build:**
-  1. On an internet-connected machine, vendor the dependencies into the repository:
-     ```bash
-     cargo vendor vendor
-     ```
-     And add to `.cargo/config.toml`:
-     ```toml
-     [source.crates-io]
-     replace-with = "vendored-sources"
-
-     [source.vendored-sources]
-     directory = "vendor"
-     ```
-  2. Copy the repository folder to the air-gapped Kali machine and build offline:
-     ```bash
-     cargo build --release --offline --bin rexeditor
-     ```
