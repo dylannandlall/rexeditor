@@ -87,19 +87,114 @@ pub fn merge_selections(primary: Option<Selection>, additional: &[Selection]) ->
     merged
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+/// A named byte range drawn on top of the hex view.
+///
+/// Each field has three independent, optional highlight styles: a `border` drawn
+/// around the range, a `text` color for its hex/ASCII glyphs, and a `background`
+/// fill. By default only the border is used.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(from = "FieldRepr")]
 pub struct Field {
     pub name: String,
     pub description: String,
     pub start: usize,
     pub end: usize,
-    pub color: FieldColor,
-    /// Background shading behind the field's bytes, independent of `color`.
+    /// Outline drawn around the field's bytes (`None` = no border).
+    pub border: Option<FieldColor>,
+    /// Color of the field's hex and ASCII text (`None` = normal byte coloring).
+    pub text: Option<FieldColor>,
+    /// Fill behind the field's bytes (`None` = no background).
     pub background: Option<FieldColor>,
+    /// Whether the field is drawn in the hex view. Hidden fields stay in the overlay.
+    pub visible: bool,
+}
+
+impl Default for Field {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            start: 0,
+            end: 0,
+            border: Some(FieldColor::default()),
+            text: None,
+            background: None,
+            visible: true,
+        }
+    }
+}
+
+/// On-disk field representation. Accepts both the current format and the legacy
+/// `{ "color": .., "background": .. }` format, where `color` tinted the text and
+/// outlined the range; legacy `color` is mapped to `border`.
+#[derive(Deserialize)]
+#[serde(default)]
+struct FieldRepr {
+    name: String,
+    description: String,
+    start: usize,
+    end: usize,
+    #[serde(deserialize_with = "present")]
+    border: Option<Option<FieldColor>>,
+    #[serde(deserialize_with = "present")]
+    text: Option<Option<FieldColor>>,
+    background: Option<FieldColor>,
+    color: Option<FieldColor>,
+    visible: bool,
+}
+
+impl Default for FieldRepr {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            start: 0,
+            end: 0,
+            border: None,
+            text: None,
+            background: None,
+            color: None,
+            visible: true,
+        }
+    }
+}
+
+/// Distinguishes a key that is present (even as `null`) from a missing key.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl From<FieldRepr> for Field {
+    fn from(r: FieldRepr) -> Self {
+        let legacy = r.border.is_none() && r.text.is_none();
+        let border = match r.border {
+            Some(border) => border,
+            None if legacy => Some(r.color.unwrap_or_default()),
+            None => None,
+        };
+        Self {
+            name: r.name,
+            description: r.description,
+            start: r.start,
+            end: r.end,
+            border,
+            text: r.text.flatten(),
+            background: r.background,
+            visible: r.visible,
+        }
+    }
 }
 
 impl Field {
+    /// The most prominent color of the field, for list swatches and similar.
+    pub fn swatch_color(&self) -> Option<FieldColor> {
+        self.border.or(self.text).or(self.background)
+    }
+
     pub fn contains(&self, offset: usize) -> bool {
         (self.start..=self.end).contains(&offset)
     }
@@ -623,6 +718,36 @@ mod tests {
         assert_eq!(FieldColor::Cyan.next(), FieldColor::Green);
         assert_eq!(FieldColor::Cyan.previous(), FieldColor::Gray);
         assert_eq!(FieldColor::Gray.next(), FieldColor::Cyan);
+    }
+
+    #[test]
+    fn legacy_field_color_maps_to_border() {
+        let f: Field = serde_json::from_str(
+            r#"{"name":"a","description":"","start":1,"end":2,"color":"Green","background":"Blue"}"#,
+        )
+        .unwrap();
+        assert_eq!(f.border, Some(FieldColor::Green));
+        assert_eq!(f.text, None);
+        assert_eq!(f.background, Some(FieldColor::Blue));
+        assert!(f.visible);
+
+        let f: Field = serde_json::from_str(r#"{"name":"b","start":0,"end":0}"#).unwrap();
+        assert_eq!(f.border, Some(FieldColor::Cyan));
+    }
+
+    #[test]
+    fn field_round_trips_explicit_none_colors() {
+        let f = Field {
+            name: "x".into(),
+            border: None,
+            text: Some(FieldColor::Red),
+            background: None,
+            visible: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&f).unwrap();
+        let back: Field = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, f);
     }
 
     #[test]

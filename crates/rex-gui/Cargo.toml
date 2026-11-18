@@ -10,12 +10,25 @@ description = "Modern cross-platform hex editor and binary analysis workstation 
 name = "rexeditor"
 path = "src/main.rs"
 
+[features]
+# Both front ends are built by default. For machines without a graphical stack
+# (e.g. server installs), build only the terminal UI:
+#   cargo build --release -p rex-gui --no-default-features --features tui
+default = ["gui", "tui"]
+gui = ["dep:eframe", "dep:egui", "dep:egui_tiles", "dep:rfd", "dep:arboard"]
+tui = ["dep:ratatui", "dep:crossterm"]
+
 [dependencies]
 rex-core = { path = "../rex-core" }
-eframe.workspace = true
-egui.workspace = true
-egui_tiles.workspace = true
-rfd.workspace = true
-arboard.workspace = true
+eframe = { workspace = true, optional = true }
+egui = { workspace = true, optional = true }
+egui_tiles = { workspace = true, optional = true }
+rfd = { workspace = true, optional = true }
+arboard = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true }
+crossterm = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

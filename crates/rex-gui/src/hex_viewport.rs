@@ -5,7 +5,7 @@
 //! a single hit-test map pointer positions to either the Hex or ASCII column.
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
-use rex_core::{ByteBuffer, CopyFormat, DisplayRow, Document, EditKind, SearchMatch};
+use rex_core::{ByteBuffer, CopyFormat, DisplayRow, Document, EditKind, Field, SearchMatch};
 
 use crate::theme::{byte_color32, field_color32, hex_byte_str, named_color32};
 
@@ -94,6 +94,46 @@ impl Layout {
                 (self.bpr - 1, fallback)
             }
         })
+    }
+}
+
+/// Which sides of a byte cell lie on the outside of its field's range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BorderEdges {
+    top: bool,
+    bottom: bool,
+    left: bool,
+    right: bool,
+}
+
+impl BorderEdges {
+    /// Edges of the byte at `abs` (column `i` of a row holding `count` bytes, `bpr`
+    /// per row) that face outside `field`, i.e. where its border must be drawn.
+    fn for_byte(field: &Field, abs: usize, i: usize, count: usize, bpr: usize) -> Self {
+        Self {
+            top: abs < bpr || !field.contains(abs - bpr),
+            bottom: !field.contains(abs + bpr),
+            left: i == 0 || !field.contains(abs - 1),
+            right: i + 1 == count || !field.contains(abs + 1),
+        }
+    }
+}
+
+fn paint_border(painter: &egui::Painter, cell: Rect, edges: BorderEdges, stroke: Stroke) {
+    let inset = stroke.width * 0.5;
+    let (l, r) = (cell.left() + inset, cell.right() - inset);
+    let (t, b) = (cell.top() + inset, cell.bottom() - inset);
+    if edges.top {
+        painter.hline(cell.left()..=cell.right(), t, stroke);
+    }
+    if edges.bottom {
+        painter.hline(cell.left()..=cell.right(), b, stroke);
+    }
+    if edges.left {
+        painter.vline(l, cell.y_range(), stroke);
+    }
+    if edges.right {
+        painter.vline(r, cell.y_range(), stroke);
     }
 }
 
@@ -306,13 +346,16 @@ pub fn render_hex_viewport(
     }
 
     let pending_insert = doc.pending_insert_nibble();
+    // Set while a drag-selection started in this viewport is in progress. The drag is
+    // tracked at the viewport level (not per row) so it survives the starting row
+    // scrolling out of view during edge auto-scroll.
+    let drag_id = egui::Id::new((viewport_id, "drag_select"));
 
-    scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
+    let output = scroll_area.show_rows(ui, row_height, total_rows, |ui, row_range| {
             let row_clip = ui.clip_rect().intersect(pane_clip);
             ui.set_clip_rect(row_clip);
             doc.visible_rows = row_range.len().max(1);
             doc.scroll = row_range.start;
-            let buf_len = doc.buffer.len();
 
             for row in row_range {
                 match doc.display_row(row) {
@@ -383,10 +426,11 @@ pub fn render_hex_viewport(
                             let byte = row_buf[i];
                             let selected = doc.is_selected(abs);
                             let field = if doc.settings.show_overlays {
-                                doc.fields.iter().find(|f| f.contains(abs))
+                                doc.fields.iter().find(|f| f.visible && f.contains(abs))
                             } else {
                                 None
                             };
+                            let field_text = field.and_then(|f| f.text);
 
                             let bg = if diff_other.is_some_and(|o| o.get(abs) != Some(byte)) {
                                 Some(DIFF_BG)
@@ -394,19 +438,17 @@ pub fn render_hex_viewport(
                                 Some(SELECTION_BG)
                             } else if in_search_match(search_matches, abs) {
                                 Some(SEARCH_BG)
-                            } else if let Some(f) = field {
-                                f.background
-                                    .map(|bg_col| field_color32(bg_col).gamma_multiply(0.35))
-                                    .or_else(|| Some(field_color32(f.color).gamma_multiply(0.14)))
                             } else {
-                                None
+                                field
+                                    .and_then(|f| f.background)
+                                    .map(|c| field_color32(c).gamma_multiply(0.45))
                             };
                             let fg = if selected {
                                 Color32::WHITE
                             } else if doc.buffer.is_modified(abs) {
                                 named_color32(doc.theme.modified)
-                            } else if let Some(f) = field {
-                                field_color32(f.color)
+                            } else if let Some(c) = field_text {
+                                field_color32(c)
                             } else {
                                 byte_color32(&doc.theme, abs, byte, false)
                             };
@@ -426,18 +468,25 @@ pub fn render_hex_viewport(
                                     painter.rect_filled(ascii_rect, 0.0, bg);
                                 }
                             }
-                            if let Some(f) = field {
-                                let stroke = Stroke::new(1.5_f32, field_color32(f.color));
-                                let y = rect.bottom() - 1.0;
-                                painter.hline(hex_rect.x_range(), y, stroke);
-                                if abs == f.start {
-                                    painter.vline(hex_rect.left() + 1.0, rect.y_range(), stroke);
-                                }
-                                if abs == f.end {
-                                    painter.vline(hex_rect.right() - 1.0, rect.y_range(), stroke);
-                                }
+                            if let Some(f) = field
+                                && let Some(border) = f.border
+                            {
+                                let stroke = Stroke::new(1.5_f32, field_color32(border));
+                                let edges = BorderEdges::for_byte(f, abs, i, count, bpr);
+                                // Extend top/bottom lines across the gap to the next cell
+                                // so a multi-byte border reads as one continuous box.
+                                let hex_span_right = if edges.right {
+                                    hex_rect.right()
+                                } else {
+                                    lay.hex_x(i + 1) - 0.5 * char_w
+                                };
+                                let hex_border = Rect::from_x_y_ranges(
+                                    hex_rect.left()..=hex_span_right,
+                                    rect.y_range(),
+                                );
+                                paint_border(&painter, hex_border, edges, stroke);
                                 if show_ascii {
-                                    painter.hline(ascii_rect.x_range(), y, stroke);
+                                    paint_border(&painter, ascii_rect, edges, stroke);
                                 }
                             }
                             if cursor == Some(abs) {
@@ -487,8 +536,10 @@ pub fn render_hex_viewport(
                                 draw_fg,
                             );
                             if show_ascii {
-                                let afg =
-                                    if selected || doc.buffer.is_modified(abs) || field.is_some() {
+                                let afg = if selected
+                                    || doc.buffer.is_modified(abs)
+                                    || field_text.is_some()
+                                {
                                         fg
                                     } else {
                                         byte_color32(&doc.theme, abs, byte, true)
@@ -513,7 +564,11 @@ pub fn render_hex_viewport(
                             && col < count
                         {
                             let hovered_off = offset + col;
-                            if let Some(f) = doc.fields.iter().find(|f| f.contains(hovered_off)) {
+                            if let Some(f) = doc
+                                .fields
+                                .iter()
+                                .find(|f| f.visible && f.contains(hovered_off))
+                            {
                                 let tip = if f.description.is_empty() {
                                     format!(
                                         "Field: {}\nRange: 0x{:X}..0x{:X} ({} bytes)",
@@ -537,7 +592,15 @@ pub fn render_hex_viewport(
                         }
 
                         // ---- Mouse interaction ----
-                        let pointer = ui.input(|i| i.pointer.interact_pos());
+                        // A drag is only recognized after the pointer moves a few pixels, so
+                        // anchor it where the button went down rather than where it is now.
+                        let pointer = ui.input(|i| {
+                            if resp.drag_started() {
+                                i.pointer.press_origin().or(i.pointer.interact_pos())
+                            } else {
+                                i.pointer.interact_pos()
+                            }
+                        });
                         let (ctrl, shift) =
                             ui.input(|i| (i.modifiers.command || i.modifiers.ctrl, i.modifiers.shift));
                         if resp.clicked() || resp.drag_started() {
@@ -558,26 +621,17 @@ pub fn render_hex_viewport(
                                 } else {
                                     doc.select_offset(clicked, shift);
                                 }
-                            }
-                        } else if resp.dragged()
-                            && let Some(pos) = pointer
-                        {
-                            let (col, _) = lay.hit_test_clamped(pos.x, *active_column);
-                            let row_delta = ((pos.y - rect.top()) / row_height).floor() as isize;
-                            let target =
-                                offset as isize + row_delta * bpr as isize + col as isize;
-                            let max = buf_len.saturating_sub(1) as isize;
-                            let dragged = target.clamp(0, max) as usize;
-                            if let Some(sel) = &mut doc.selection {
-                                sel.cursor = dragged;
+                                if resp.drag_started() && !ctrl {
+                                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, true));
+                                }
                             }
                         }
 
                         resp.context_menu(|ui| {
                             ui.set_min_width(190.0);
                             for (label, fmt) in [
-                                ("Copy Hex (Ctrl+C)", CopyFormat::HexSpaced),
-                                ("Copy Compact Hex", CopyFormat::HexCompact),
+                                ("Copy Hex (Ctrl+C)", CopyFormat::HexCompact),
+                                ("Copy Hex with Spaces (Ctrl+Alt+C)", CopyFormat::HexSpaced),
                                 ("Copy ASCII (Ctrl+Shift+C)", CopyFormat::Ascii),
                                 ("Copy as C Array", CopyFormat::CArray),
                                 ("Copy as Rust Array", CopyFormat::RustArray),
@@ -625,4 +679,279 @@ pub fn render_hex_viewport(
                 }
             }
         });
+
+    update_drag_selection(
+        ui,
+        doc,
+        &output,
+        drag_id,
+        Layout {
+            left: output.inner_rect.left() - output.state.offset.x,
+            ..header_layout
+        },
+        row_height,
+        total_rows,
+        *active_column,
+    );
+}
+
+/// Extends an in-progress drag selection to the byte under the pointer and auto-scrolls
+/// the viewport when the pointer is held near (or beyond) its top or bottom edge.
+#[allow(clippy::too_many_arguments)]
+fn update_drag_selection(
+    ui: &egui::Ui,
+    doc: &mut Document,
+    output: &egui::scroll_area::ScrollAreaOutput<()>,
+    drag_id: egui::Id,
+    lay: Layout,
+    row_height: f32,
+    total_rows: usize,
+    active_column: EditColumn,
+) {
+    let ctx = ui.ctx();
+    if !ctx.data(|d| d.get_temp::<bool>(drag_id)).unwrap_or(false) {
+        return;
+    }
+    let (primary_down, pointer, dt) =
+        ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos(), i.stable_dt));
+    if !primary_down {
+        ctx.data_mut(|d| d.remove::<bool>(drag_id));
+        return;
+    }
+    let Some(pos) = pointer else {
+        return;
+    };
+    if total_rows == 0 || doc.buffer.is_empty() {
+        return;
+    }
+
+    let inner = output.inner_rect;
+    let mut state = output.state;
+
+    // Edge auto-scroll: speed grows with how far into (or past) the edge zone the pointer is.
+    let edge = (row_height * 1.5).min(inner.height() * 0.25).max(1.0);
+    let depth = if pos.y < inner.top() + edge {
+        pos.y - (inner.top() + edge)
+    } else if pos.y > inner.bottom() - edge {
+        pos.y - (inner.bottom() - edge)
+    } else {
+        0.0
+    };
+    let mut lay = lay;
+    if depth != 0.0 {
+        let rows_per_sec = (depth / edge * 10.0).clamp(-80.0, 80.0);
+        let delta = rows_per_sec * row_height * dt.clamp(0.0, 0.1);
+        let max_offset = (output.content_size.y - inner.height()).max(0.0);
+        let new_offset = (state.offset.y + delta).clamp(0.0, max_offset);
+        if new_offset != state.offset.y {
+            state.offset.y = new_offset;
+            state.store(ctx, output.id);
+        }
+        // Keep frames coming while the pointer rests in the edge zone.
+        ctx.request_repaint();
+    }
+    lay.left = inner.left() - state.offset.x;
+
+    let y = pos.y.clamp(inner.top(), (inner.bottom() - 1.0).max(inner.top()));
+    let row = (((y - inner.top() + state.offset.y) / row_height).floor().max(0.0) as usize)
+        .min(total_rows - 1);
+    let (col, _) = lay.hit_test_clamped(pos.x, active_column);
+    let target = match doc.display_row(row) {
+        DisplayRow::Bytes { offset } => offset + col,
+        DisplayRow::Repeated { start, .. } => start,
+    };
+    let target = target.min(doc.buffer.len() - 1);
+    if let Some(sel) = &mut doc.selection
+        && sel.cursor != target
+    {
+        sel.cursor = target;
+        ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{Harness, find_text};
+    use egui::{FullOutput, Shape};
+    use rex_core::FieldColor;
+
+    fn field(start: usize, end: usize) -> Field {
+        Field {
+            name: "f".into(),
+            start,
+            end,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn border_edges_outline_a_multi_row_field() {
+        let f = field(4, 20);
+        let edges = |abs: usize, count: usize| BorderEdges::for_byte(&f, abs, abs % 16, count, 16);
+        // First byte: top and left edges only.
+        assert_eq!(
+            edges(4, 16),
+            BorderEdges { top: true, bottom: false, left: true, right: false }
+        );
+        // End of the first row: the row break closes the right side.
+        assert_eq!(
+            edges(15, 16),
+            BorderEdges { top: true, bottom: true, left: false, right: true }
+        );
+        // Start of the second row opens on the left.
+        assert_eq!(
+            edges(16, 16),
+            BorderEdges { top: true, bottom: true, left: true, right: false }
+        );
+        // Last byte: below it and to its right are outside the field.
+        assert_eq!(
+            edges(20, 16),
+            BorderEdges { top: false, bottom: true, left: false, right: true }
+        );
+        // Last byte of a short final row closes on the right.
+        assert!(BorderEdges::for_byte(&field(0, 100), 17, 1, 2, 16).right);
+    }
+
+    fn draw(h: &mut Harness, doc: &mut Document, column: &mut EditColumn) -> FullOutput {
+        let mut add = false;
+        h.frame(|ui| render_hex_viewport(ui, "hex_viewport_primary", doc, &[], None, column, &mut add))
+    }
+
+    /// Stroke, fill and text colors used in a frame.
+    fn colors(out: &FullOutput) -> (Vec<Color32>, Vec<Color32>, Vec<Color32>) {
+        let (mut lines, mut fills, mut texts) = (Vec::new(), Vec::new(), Vec::new());
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::LineSegment { stroke, .. } => lines.push(stroke.color),
+                Shape::Rect(r) => fills.push(r.fill),
+                Shape::Text(t) => texts.extend(t.galley.job.sections.iter().map(|s| s.format.color)),
+                _ => {}
+            }
+        }
+        (lines, fills, texts)
+    }
+
+    #[test]
+    fn field_border_text_and_background_are_drawn_only_while_visible() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0x41; 64]);
+        doc.select_offset(40, false);
+        doc.add_field(Field {
+            border: Some(FieldColor::Red),
+            text: Some(FieldColor::Green),
+            background: Some(FieldColor::Blue),
+            ..field(2, 5)
+        });
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 400.0);
+        draw(&mut h, &mut doc, &mut column);
+        let (lines, fills, texts) = colors(&draw(&mut h, &mut doc, &mut column));
+        let red = field_color32(FieldColor::Red);
+        let green = field_color32(FieldColor::Green);
+        let blue_bg = field_color32(FieldColor::Blue).gamma_multiply(0.45);
+        assert!(lines.contains(&red), "border should be drawn");
+        assert!(texts.contains(&green), "text color should be used");
+        assert!(fills.contains(&blue_bg), "background should be filled");
+
+        doc.fields[0].visible = false;
+        let (lines, fills, texts) = colors(&draw(&mut h, &mut doc, &mut column));
+        assert!(!lines.contains(&red));
+        assert!(!texts.contains(&green));
+        assert!(!fills.contains(&blue_bg));
+    }
+
+    #[test]
+    fn border_only_field_leaves_text_and_background_alone() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0x41; 64]);
+        doc.add_field(Field {
+            border: Some(FieldColor::Magenta),
+            ..field(2, 5)
+        });
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 400.0);
+        draw(&mut h, &mut doc, &mut column);
+        let (lines, fills, texts) = colors(&draw(&mut h, &mut doc, &mut column));
+        let magenta = field_color32(FieldColor::Magenta);
+        assert!(lines.contains(&magenta));
+        assert!(!texts.contains(&magenta));
+        assert!(!fills.iter().any(|c| *c == magenta.gamma_multiply(0.45)));
+    }
+
+    /// Position of byte `col` on the row whose offset label reads `label`.
+    fn byte_pos(out: &FullOutput, label: &str, col: usize) -> Pos2 {
+        let r = find_text(out, label).unwrap_or_else(|| panic!("row {label} not drawn"));
+        let char_w = r.width() / label.len() as f32;
+        // Offsets take 10 columns; each byte 3; +1 for centre of the first digit.
+        Pos2::new(r.left() + (10 + 3 * col) as f32 * char_w + char_w, r.center().y)
+    }
+
+    #[test]
+    fn dragging_past_the_bottom_edge_scrolls_and_extends_selection() {
+        let mut doc = Document::from_bytes("t.bin".into(), (0..16 * 400).map(|i| i as u8).collect());
+        doc.select_offset(0, false);
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 420.0);
+        draw(&mut h, &mut doc, &mut column);
+        let out = draw(&mut h, &mut doc, &mut column);
+        assert_eq!(doc.scroll, 0);
+
+        let start = byte_pos(&out, "00000030", 2);
+        h.press(start);
+        draw(&mut h, &mut doc, &mut column);
+        // The first move crosses into the next byte before egui recognises the drag.
+        for delta in [Vec2::new(30.0, 0.0), Vec2::new(30.0, 40.0), Vec2::new(0.0, 120.0)] {
+            h.move_to(start + delta);
+            draw(&mut h, &mut doc, &mut column);
+        }
+        assert_eq!(doc.selection.unwrap().anchor, 0x32, "drag anchors where it was pressed");
+        assert_eq!(doc.scroll, 0, "no scrolling away from the edges");
+
+        // Hold the pointer below the viewport.
+        h.move_to(Pos2::new(start.x, 418.0));
+        for _ in 0..40 {
+            draw(&mut h, &mut doc, &mut column);
+        }
+        let scrolled = doc.scroll;
+        assert!(scrolled > 5, "viewport should auto-scroll down, scroll = {scrolled}");
+        let sel = doc.selection.unwrap();
+        assert_eq!(sel.anchor, 0x32);
+        assert!(sel.cursor / 16 >= scrolled, "selection follows the scrolled rows");
+
+        // Releasing stops the auto-scroll.
+        h.release(Pos2::new(start.x, 418.0));
+        draw(&mut h, &mut doc, &mut column);
+        let after_release = doc.scroll;
+        for _ in 0..10 {
+            draw(&mut h, &mut doc, &mut column);
+        }
+        assert_eq!(doc.scroll, after_release);
+    }
+
+    #[test]
+    fn dragging_past_the_top_edge_scrolls_up() {
+        let mut doc = Document::from_bytes("t.bin".into(), (0..16 * 400).map(|i| i as u8).collect());
+        doc.select_offset(16 * 200, false);
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 420.0);
+        draw(&mut h, &mut doc, &mut column);
+        let out = draw(&mut h, &mut doc, &mut column);
+        let top_row = doc.scroll;
+        assert!(top_row > 100);
+
+        let label = format!("{:08X}", (top_row + 6) * 16);
+        let start = byte_pos(&out, &label, 0);
+        h.press(start);
+        draw(&mut h, &mut doc, &mut column);
+        h.move_to(start - Vec2::new(0.0, 20.0));
+        draw(&mut h, &mut doc, &mut column);
+        h.move_to(Pos2::new(start.x, 2.0));
+        for _ in 0..40 {
+            draw(&mut h, &mut doc, &mut column);
+        }
+        assert!(doc.scroll + 5 < top_row, "viewport should auto-scroll up");
+        let sel = doc.selection.unwrap();
+        assert!(sel.cursor < sel.anchor);
+        h.release(Pos2::new(start.x, 2.0));
+        draw(&mut h, &mut doc, &mut column);
+    }
 }

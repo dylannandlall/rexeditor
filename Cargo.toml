@@ -23,6 +23,8 @@ egui = "0.31"
 egui_tiles = "0.12"
 rfd = "0.15"
 arboard = "3.4"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["osc52"] }
 
 [profile.release]
 codegen-units = 1

@@ -12,6 +12,8 @@ pub struct InspectorUiState {
     pub endianness: Endianness,
     pub editing_kind: Option<String>,
     pub edit_buffer: String,
+    /// Set for one frame when an edit starts so the text box grabs keyboard focus.
+    pub focus_edit: bool,
 }
 
 #[derive(Default)]
@@ -22,8 +24,10 @@ pub struct FieldEditorState {
     pub description: String,
     pub start_str: String,
     pub end_str: String,
-    pub color: FieldColor,
+    pub border: Option<FieldColor>,
+    pub text: Option<FieldColor>,
     pub background: Option<FieldColor>,
+    pub visible: bool,
     pub filter: String,
 }
 
@@ -40,6 +44,9 @@ impl FieldEditorState {
             name: format!("field_{}", doc.fields.len() + 1),
             start_str: format!("0x{s:X}"),
             end_str: format!("0x{e:X}"),
+            // Only a border by default; rotate colors so adjacent fields differ.
+            border: Some(FieldColor::ALL[doc.fields.len() % FieldColor::ALL.len()]),
+            visible: true,
             filter,
             ..Default::default()
         };
@@ -56,7 +63,11 @@ fn truncate_display(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Renders one inspector row. `kind` (if `Some`) enables inline editing.
+/// Renders one inspector row and returns the value widget's response.
+///
+/// Clicking the value copies it to the clipboard. When `kind` is `Some`, double-clicking
+/// turns the value into a text box: Enter writes the new value, Esc or clicking away
+/// cancels.
 fn value_row(
     ui: &mut egui::Ui,
     doc: &mut Document,
@@ -65,54 +76,93 @@ fn value_row(
     label: &str,
     value: &str,
     kind: Option<&str>,
-) {
+) -> egui::Response {
     ui.label(label);
-    ui.horizontal(|ui| {
-        let editing = kind.is_some() && state.editing_kind.as_deref() == kind;
-        if editing {
-            let resp =
-                ui.add(egui::TextEdit::singleline(&mut state.edit_buffer).desired_width(110.0));
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let apply = ui.small_button("Apply").clicked() || enter;
-            if ui.small_button("X").clicked() {
-                state.editing_kind = None;
-            } else if apply {
-                if let Some(k) = kind {
-                    match InspectorValue::parse_as(k, &state.edit_buffer, state.endianness) {
-                        Ok(bytes) => doc.overwrite_bytes(range_start, &bytes),
-                        Err(err) => doc.status = err,
-                    }
-                }
-                state.editing_kind = None;
-            }
-        } else {
-            let display = truncate_display(value, 22);
-            let lbl = ui.add(
-                egui::Label::new(egui::RichText::new(&display).monospace()).truncate(),
-            );
-            if display != value {
-                lbl.on_hover_text(value);
-            }
-            if value != "-"
-                && !value.is_empty()
-                && ui
-                    .small_button("📋")
-                    .on_hover_text("Copy value to clipboard")
-                    .clicked()
-                && let Ok(mut cb) = arboard::Clipboard::new()
-            {
-                let _ = cb.set_text(value.to_string());
-                doc.status = format!("Copied {label}: {display}");
-            }
-            if let Some(k) = kind
-                && ui.small_button("Edit").clicked()
-            {
-                state.editing_kind = Some(k.to_string());
-                state.edit_buffer = value.to_string();
-            }
+    let editing = kind.is_some() && state.editing_kind.as_deref() == kind;
+    let resp = if editing {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut state.edit_buffer)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(ui.available_width().max(80.0)),
+        );
+        if std::mem::take(&mut state.focus_edit) {
+            resp.request_focus();
         }
-    });
+        if resp.lost_focus() {
+            let (enter, escape) =
+                ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if enter
+                && !escape
+                && let Some(k) = kind
+            {
+                match InspectorValue::parse_as(k, &state.edit_buffer, state.endianness) {
+                    Ok(bytes) => {
+                        doc.overwrite_bytes(range_start, &bytes);
+                        doc.status = format!("Wrote {label} = {}", state.edit_buffer.trim());
+                    }
+                    Err(err) => doc.status = err,
+                }
+            }
+            state.editing_kind = None;
+        }
+        resp
+    } else {
+        let copyable = value != "-" && !value.is_empty();
+        let display = truncate_display(value, 22);
+        let resp = copyable_value(ui, &display);
+        let hint = match (copyable, kind.is_some()) {
+            (true, true) => "Click to copy · Double-click to edit",
+            (true, false) => "Click to copy",
+            (false, true) => "Double-click to edit",
+            (false, false) => "",
+        };
+        let resp = if display != value {
+            resp.on_hover_text(format!("{value}\n\n{hint}"))
+        } else if !hint.is_empty() {
+            resp.on_hover_text(hint)
+        } else {
+            resp
+        };
+        if let Some(k) = kind
+            && resp.double_clicked()
+        {
+            state.editing_kind = Some(k.to_string());
+            state.edit_buffer = if copyable { value.to_string() } else { String::new() };
+            state.focus_edit = true;
+        } else if copyable && resp.clicked() {
+            copy_to_clipboard(ui, value);
+            doc.status = format!("Copied {label}: {display}");
+        }
+        resp
+    };
     ui.end_row();
+    resp
+}
+
+/// A monospace value that behaves like a read-only text box: it highlights on hover
+/// and reports clicks.
+fn copyable_value(ui: &mut egui::Ui, display: &str) -> egui::Response {
+    let resp = ui.add(
+        egui::Label::new(egui::RichText::new(display).monospace())
+            .truncate()
+            .sense(Sense::click()),
+    );
+    if resp.hovered() {
+        ui.painter().rect_stroke(
+            resp.rect.expand(2.0),
+            2.0,
+            Stroke::new(1.0_f32, Color32::from_gray(110)),
+            egui::StrokeKind::Outside,
+        );
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+fn copy_to_clipboard(ui: &egui::Ui, text: &str) {
+    ui.ctx().copy_text(text.to_string());
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
 }
 
 fn format_numeric(data: &InspectorData, kind: &str, endian: Endianness) -> String {
@@ -279,20 +329,14 @@ pub fn render_inspector_panel(
                                     ui.weak(res);
                                 } else {
                                     let disp = truncate_display(res, 22);
-                                    let lbl = ui.add(
-                                        egui::Label::new(egui::RichText::new(&disp).monospace())
-                                            .truncate(),
-                                    );
-                                    if disp != res {
-                                        lbl.on_hover_text(res);
-                                    }
-                                    if ui
-                                        .small_button("📋")
-                                        .on_hover_text("Copy plugin output")
-                                        .clicked()
-                                        && let Ok(mut cb) = arboard::Clipboard::new()
-                                    {
-                                        let _ = cb.set_text(res.to_string());
+                                    let lbl = copyable_value(ui, &disp);
+                                    let lbl = if disp != res {
+                                        lbl.on_hover_text(format!("{res}\n\nClick to copy"))
+                                    } else {
+                                        lbl.on_hover_text("Click to copy")
+                                    };
+                                    if lbl.clicked() {
+                                        copy_to_clipboard(ui, res);
                                         doc.status = format!("Copied {}: {disp}", p.name);
                                     }
                                 }
@@ -304,27 +348,75 @@ pub fn render_inspector_panel(
         });
 }
 
-fn color_selector(ui: &mut egui::Ui, id: &str, current: &mut FieldColor) {
+/// Swatch picker for one optional highlight style; the first swatch means "no color".
+fn color_selector(ui: &mut egui::Ui, id: &str, current: &mut Option<FieldColor>) {
     ui.horizontal_wrapped(|ui| {
         ui.push_id(id, |ui| {
-            for c in FieldColor::ALL {
-                let selected = *current == c;
+            let choices = std::iter::once(None).chain(FieldColor::ALL.into_iter().map(Some));
+            for choice in choices {
                 let (rect, resp) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-                ui.painter().rect_filled(rect, 3.0, field_color32(c));
-                if selected {
-                    ui.painter().rect_stroke(
+                let painter = ui.painter();
+                match choice {
+                    Some(c) => {
+                        painter.rect_filled(rect, 3.0, field_color32(c));
+                    }
+                    None => {
+                        painter.rect_stroke(
+                            rect.shrink(1.0),
+                            3.0,
+                            Stroke::new(1.0_f32, Color32::from_gray(150)),
+                            egui::StrokeKind::Inside,
+                        );
+                        painter.line_segment(
+                            [rect.left_bottom() + Vec2::new(3.0, -3.0), rect.right_top() + Vec2::new(-3.0, 3.0)],
+                            Stroke::new(1.5_f32, Color32::from_rgb(230, 90, 90)),
+                        );
+                    }
+                }
+                if *current == choice {
+                    painter.rect_stroke(
                         rect,
                         3.0,
                         Stroke::new(2.0_f32, Color32::WHITE),
                         egui::StrokeKind::Outside,
                     );
                 }
-                if resp.on_hover_text(c.name()).clicked() {
-                    *current = c;
+                let tip = choice.map_or("No color", FieldColor::name);
+                if resp
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    *current = choice;
                 }
             }
         });
     });
+}
+
+/// Small preview of a field's highlight styles (background, border and text color).
+fn field_swatch(ui: &mut egui::Ui, f: &Field) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 14.0), Sense::hover());
+    let painter = ui.painter();
+    if let Some(bg) = f.background {
+        painter.rect_filled(rect, 2.0, field_color32(bg).gamma_multiply(0.6));
+    }
+    if let Some(border) = f.border {
+        painter.rect_stroke(
+            rect,
+            2.0,
+            Stroke::new(1.5_f32, field_color32(border)),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let text = f.text.map_or(Color32::from_gray(200), field_color32);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "A",
+        egui::FontId::monospace(10.0),
+        text,
+    );
 }
 
 pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut FieldEditorState) {
@@ -344,8 +436,10 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 description: f.description.clone(),
                 start_str: format!("0x{:X}", f.start),
                 end_str: format!("0x{:X}", f.end),
-                color: f.color,
+                border: f.border,
+                text: f.text,
                 background: f.background,
+                visible: f.visible,
                 filter,
             };
         }
@@ -400,6 +494,7 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
 
     let needle = editor.filter.trim().to_ascii_lowercase();
     let mut clicked: Option<usize> = None;
+    let mut visibility_toggled: Option<(usize, bool)> = None;
     egui::ScrollArea::vertical()
         .max_height(if editor.open { 150.0 } else { 220.0 })
         .id_salt("fields_list")
@@ -423,9 +518,21 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 );
                 let resp = ui
                     .horizontal(|ui| {
-                        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, field_color32(f.color));
-                        ui.selectable_label(selected, label)
+                        let mut visible = f.visible;
+                        if ui
+                            .checkbox(&mut visible, "")
+                            .on_hover_text("Show or hide this field in the hex view")
+                            .changed()
+                        {
+                            visibility_toggled = Some((idx, visible));
+                        }
+                        field_swatch(ui, f);
+                        let text = if f.visible {
+                            egui::RichText::new(label)
+                        } else {
+                            egui::RichText::new(label).weak()
+                        };
+                        ui.selectable_label(selected, text)
                     })
                     .inner;
                 if !f.description.is_empty() {
@@ -439,6 +546,10 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 ui.weak("No fields defined. Select bytes and click '+ Add Field' (or press 'a').");
             }
         });
+    if let Some((idx, visible)) = visibility_toggled {
+        doc.fields[idx].visible = visible;
+        let _ = doc.persist_automatic_overlay();
+    }
     if let Some(idx) = clicked {
         let (start, end) = (doc.fields[idx].start, doc.fields[idx].end);
         doc.selected_field = idx;
@@ -474,17 +585,12 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                 ui.text_edit_singleline(&mut editor.end_str);
                 ui.end_row();
             });
-        ui.label("Foreground Color");
-        color_selector(ui, "fg", &mut editor.color);
-        ui.horizontal(|ui| {
-            let mut has_bg = editor.background.is_some();
-            if ui.checkbox(&mut has_bg, "Background Shading").changed() {
-                editor.background = if has_bg { Some(editor.color) } else { None };
-            }
-        });
-        if let Some(bg) = &mut editor.background {
-            color_selector(ui, "bg", bg);
-        }
+        ui.label("Border Color");
+        color_selector(ui, "border", &mut editor.border);
+        ui.label("Text Color");
+        color_selector(ui, "text", &mut editor.text);
+        ui.label("Background Color");
+        color_selector(ui, "background", &mut editor.background);
         let parsed = Document::parse_offset(&editor.start_str)
             .ok()
             .zip(Document::parse_offset(&editor.end_str).ok());
@@ -498,8 +604,10 @@ pub fn render_fields_panel(ui: &mut egui::Ui, doc: &mut Document, editor: &mut F
                     description: editor.description.clone(),
                     start: start.min(end),
                     end: start.max(end),
-                    color: editor.color,
+                    border: editor.border,
+                    text: editor.text,
                     background: editor.background,
+                    visible: editor.visible,
                 };
                 match editor.editing_index {
                     Some(i) => doc.update_field(i, field),
@@ -628,4 +736,178 @@ pub fn render_entropy_panel(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{Harness, copied_text, find_text};
+    use egui::{FullOutput, Pos2};
+
+    fn inspector_frame(
+        h: &mut Harness,
+        doc: &mut Document,
+        state: &mut InspectorUiState,
+        value: &str,
+        kind: Option<&str>,
+    ) -> (FullOutput, egui::Rect) {
+        let mut rect = egui::Rect::NOTHING;
+        let out = h.frame(|ui| {
+            egui::Grid::new("g").show(ui, |ui| {
+                rect = value_row(ui, doc, state, 0, "u8", value, kind).rect;
+            });
+        });
+        (out, rect)
+    }
+
+    fn click(h: &mut Harness, doc: &mut Document, state: &mut InspectorUiState, at: Pos2, value: &str, kind: Option<&str>) -> Option<String> {
+        h.press(at);
+        let (a, _) = inspector_frame(h, doc, state, value, kind);
+        h.release(at);
+        let (b, _) = inspector_frame(h, doc, state, value, kind);
+        copied_text(&a).or_else(|| copied_text(&b))
+    }
+
+    fn setup() -> (Harness, Document, InspectorUiState) {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![68, 0, 0, 0]);
+        doc.select_offset(0, false);
+        (Harness::new(500.0, 200.0), doc, InspectorUiState::default())
+    }
+
+    #[test]
+    fn single_click_copies_the_value() {
+        let (mut h, mut doc, mut state) = setup();
+        let (_, rect) = inspector_frame(&mut h, &mut doc, &mut state, "68", Some("u8"));
+        let copied = click(&mut h, &mut doc, &mut state, rect.center(), "68", Some("u8"));
+        assert_eq!(copied.as_deref(), Some("68"));
+        assert!(doc.status.starts_with("Copied u8"), "{}", doc.status);
+        assert!(state.editing_kind.is_none(), "a single click does not start editing");
+    }
+
+    #[test]
+    fn placeholder_values_are_not_copied() {
+        let (mut h, mut doc, mut state) = setup();
+        let (_, rect) = inspector_frame(&mut h, &mut doc, &mut state, "-", None);
+        assert_eq!(click(&mut h, &mut doc, &mut state, rect.center(), "-", None), None);
+    }
+
+    fn start_edit(h: &mut Harness, doc: &mut Document, state: &mut InspectorUiState) {
+        let (_, rect) = inspector_frame(h, doc, state, "68", Some("u8"));
+        click(h, doc, state, rect.center(), "68", Some("u8"));
+        click(h, doc, state, rect.center(), "68", Some("u8"));
+        assert_eq!(state.editing_kind.as_deref(), Some("u8"), "double-click starts editing");
+        assert_eq!(state.edit_buffer, "68");
+        // Next frame shows the focused text box.
+        inspector_frame(h, doc, state, "68", Some("u8"));
+    }
+
+    #[test]
+    fn double_click_edits_and_enter_writes() {
+        let (mut h, mut doc, mut state) = setup();
+        start_edit(&mut h, &mut doc, &mut state);
+        state.edit_buffer = "255".into();
+        h.key(egui::Key::Enter);
+        inspector_frame(&mut h, &mut doc, &mut state, "68", Some("u8"));
+        assert_eq!(doc.buffer.get(0), Some(255));
+        assert!(state.editing_kind.is_none());
+    }
+
+    #[test]
+    fn escape_cancels_an_edit() {
+        let (mut h, mut doc, mut state) = setup();
+        start_edit(&mut h, &mut doc, &mut state);
+        state.edit_buffer = "1".into();
+        h.key(egui::Key::Escape);
+        inspector_frame(&mut h, &mut doc, &mut state, "68", Some("u8"));
+        assert_eq!(doc.buffer.get(0), Some(68));
+        assert!(state.editing_kind.is_none());
+    }
+
+    #[test]
+    fn read_only_values_ignore_double_click() {
+        let (mut h, mut doc, mut state) = setup();
+        let (_, rect) = inspector_frame(&mut h, &mut doc, &mut state, "68", None);
+        click(&mut h, &mut doc, &mut state, rect.center(), "68", None);
+        click(&mut h, &mut doc, &mut state, rect.center(), "68", None);
+        assert!(state.editing_kind.is_none());
+    }
+
+    #[test]
+    fn new_fields_default_to_a_rotating_border_only() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0; 16]);
+        doc.select_offset(2, false);
+        let mut editor = FieldEditorState::default();
+        editor.begin_add_for_selection(&doc);
+        assert_eq!(editor.border, Some(FieldColor::ALL[0]));
+        assert_eq!((editor.text, editor.background), (None, None));
+        assert!(editor.visible);
+
+        doc.add_field(Field::default());
+        editor.begin_add_for_selection(&doc);
+        assert_eq!(editor.border, Some(FieldColor::ALL[1]));
+    }
+
+    fn fields_frame(h: &mut Harness, doc: &mut Document, editor: &mut FieldEditorState) -> FullOutput {
+        h.frame(|ui| render_fields_panel(ui, doc, editor))
+    }
+
+    fn click_at(h: &mut Harness, doc: &mut Document, editor: &mut FieldEditorState, at: Pos2) -> FullOutput {
+        h.press(at);
+        fields_frame(h, doc, editor);
+        h.release(at);
+        fields_frame(h, doc, editor)
+    }
+
+    #[test]
+    fn editor_can_clear_border_and_pick_text_and_background() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0; 16]);
+        doc.select_offset(2, false);
+        let mut editor = FieldEditorState::default();
+        editor.begin_add_for_selection(&doc);
+        let mut h = Harness::new(420.0, 700.0);
+        fields_frame(&mut h, &mut doc, &mut editor);
+        let out = fields_frame(&mut h, &mut doc, &mut editor);
+
+        // Each picker row starts with the "no color" swatch, followed by the colors.
+        let swatch = |out: &FullOutput, label: &str, index: usize| {
+            let r = find_text(out, label).unwrap_or_else(|| panic!("{label} not drawn"));
+            Pos2::new(r.left() + 8.0 + index as f32 * 20.0, r.bottom() + 12.0)
+        };
+        let out = click_at(&mut h, &mut doc, &mut editor, swatch(&out, "Border Color", 0));
+        assert_eq!(editor.border, None);
+        let out = click_at(&mut h, &mut doc, &mut editor, swatch(&out, "Text Color", 2));
+        assert_eq!(editor.text, Some(FieldColor::ALL[1]));
+        let out = click_at(&mut h, &mut doc, &mut editor, swatch(&out, "Background Color", 3));
+        assert_eq!(editor.background, Some(FieldColor::ALL[2]));
+
+        let save = find_text(&out, "Save").expect("Save button").center();
+        click_at(&mut h, &mut doc, &mut editor, save);
+        assert_eq!(doc.fields.len(), 1);
+        let f = &doc.fields[0];
+        assert_eq!((f.border, f.text, f.background), (None, Some(FieldColor::ALL[1]), Some(FieldColor::ALL[2])));
+        assert!(f.visible);
+    }
+
+    #[test]
+    fn field_list_checkbox_toggles_visibility() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0; 16]);
+        doc.add_field(Field {
+            name: "magic".into(),
+            start: 0,
+            end: 3,
+            ..Default::default()
+        });
+        let mut editor = FieldEditorState::default();
+        let mut h = Harness::new(420.0, 400.0);
+        fields_frame(&mut h, &mut doc, &mut editor);
+        let out = fields_frame(&mut h, &mut doc, &mut editor);
+        let label = find_text(&out, "magic").expect("field row");
+        // The checkbox is the first widget on the row, at the panel's left edge.
+        let checkbox = Pos2::new(16.0, label.center().y);
+
+        click_at(&mut h, &mut doc, &mut editor, checkbox);
+        assert!(!doc.fields[0].visible);
+        click_at(&mut h, &mut doc, &mut editor, checkbox);
+        assert!(doc.fields[0].visible);
+    }
 }

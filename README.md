@@ -24,13 +24,18 @@ rexeditor/
     │       ├── plugins.rs       # External script/executable inspector plugin runner
     │       └── python.rs        # Persistent Python 3 analysis REPL bridge
     │
-    └── rex-gui/                 # Windows Desktop GUI Workstation (eframe / egui)
+    └── rex-gui/                 # `rexeditor` binary: desktop GUI (eframe / egui) + terminal UI (ratatui)
         └── src/
-            ├── main.rs          # Native entry point & drag-and-drop window setup
-            ├── app.rs           # Multi-tab workspace, menus, shortcuts, Search/Python docks
-            ├── hex_viewport.rs  # Virtualized single-pass painter Hex + ASCII viewport
-            ├── sidebar.rs       # Interactive Data Inspector, Field Editor, and Entropy plot
-            └── theme.rs         # Zero-allocation hex lookup tables & workstation styling
+            ├── main.rs          # Entry point: picks GUI or TUI, Windows console handling
+            ├── cli.rs           # Command-line parsing shared by both front ends
+            ├── app.rs           # [gui] Multi-tab workspace, menus, shortcuts, Search/Python docks
+            ├── hex_viewport.rs  # [gui] Virtualized single-pass painter Hex + ASCII viewport
+            ├── sidebar.rs       # [gui] Data Inspector, Field Editor, and Entropy plot
+            ├── theme.rs         # [gui] Zero-allocation hex lookup tables & workstation styling
+            ├── win_console.rs   # Windows console attach/alloc for --help and --tui
+            └── tui/             # [tui] Terminal UI (`rexeditor --tui`)
+                ├── mod.rs       # State, key/mouse handling, prompts
+                └── view.rs      # Hex view, inspector, field list, help rendering
 ```
 
 ---
@@ -52,6 +57,39 @@ rexeditor/
 
 ---
 
+## Terminal UI (`--tui`)
+
+`rexeditor --tui [FILEPATH]...` runs the editor inside the terminal: no graphical display, X11 or
+Wayland needed. It works over SSH and on server installs. A build that includes the GUI also falls
+back to the terminal UI automatically on Linux when neither `DISPLAY` nor `WAYLAND_DISPLAY` is set.
+
+The terminal UI uses the same engine and overlay files as the GUI: hex/ASCII view, overwrite and
+insert editing with undo/redo, search (`/`), jump to offset (`:`), the Data Inspector, and overlay
+fields (show/hide plus border, text and background colors). Mouse clicks, drag-selection and the
+wheel work in terminals with mouse support. Copying (`y` / `Ctrl+C`) goes through the terminal's
+clipboard (OSC 52), so it also works over SSH. Press `?` inside the TUI for all keybindings.
+
+Entropy view, Python console, inspector plugins and split/diff view remain GUI-only for now.
+
+### TUI-only build
+
+To build without any GUI dependencies (eframe, winit, OpenGL, X11/Wayland), e.g. for a
+server or minimal Linux install:
+
+```bash
+cargo build --release -p rex-gui --no-default-features --features tui
+./target/release/rexeditor [FILEPATH]
+```
+
+The binary starts the terminal UI directly. The Cargo features are `gui` and `tui` (both on by
+default); `--no-default-features --features gui` builds the GUI alone.
+
+On Windows, release builds that include the GUI open the terminal UI in a new console window,
+because Windows shells don't wait for GUI-subsystem programs and would compete for keyboard
+input. Build the TUI-only binary to run it inside an existing terminal.
+
+---
+
 ## Building and Running
 
 ### Windows
@@ -59,7 +97,7 @@ rexeditor/
 cd C:\Users\dylan\Code\rexeditor
 cargo test --workspace
 cargo build --release --bin rexeditor
-.\target\release\rexeditor.exe [FILEPATH] [-o|--offset <0xHEX_OR_DEC>]
+.\target\release\rexeditor.exe [--tui] [FILEPATH] [-o|--offset <0xHEX_OR_DEC>]
 ```
 
 ### Linux / Kali Linux 2025.3 (Online & Air-Gapped Offline)
@@ -68,7 +106,7 @@ cargo build --release --bin rexeditor
 - **Online Linux build:**
   ```bash
   cargo build --release --bin rexeditor
-  ./target/release/rexeditor [FILEPATH] [-o|--offset <0xHEX_OR_DEC>]
+  ./target/release/rexeditor [--tui] [FILEPATH] [-o|--offset <0xHEX_OR_DEC>]
   ```
 - **Air-Gapped / Offline Kali 2025.3 build:**
   1. On an internet-connected machine, vendor the dependencies into the repository:

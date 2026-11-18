@@ -1563,8 +1563,8 @@ mod tests {
             description: String::new(),
             start: 2,
             end: 3,
-            color: FieldColor::Cyan,
-            background: None,
+            border: Some(FieldColor::Cyan),
+            ..Default::default()
         });
 
         doc.insert_bytes(1, &[0xFF, 0xEE]);
@@ -1594,8 +1594,9 @@ mod tests {
             description: "header".into(),
             start: 0,
             end: 3,
-            color: FieldColor::Green,
+            text: Some(FieldColor::Green),
             background: Some(FieldColor::Blue),
+            ..Default::default()
         });
         doc.save_overlay_to(&overlay_path).unwrap();
 
@@ -1695,8 +1696,8 @@ mod tests {
             description: "original".into(),
             start: 0,
             end: 1,
-            color: FieldColor::Cyan,
-            background: None,
+            border: Some(FieldColor::Cyan),
+            ..Default::default()
         });
         assert_eq!(
             doc.open_overlay_name().as_deref(),
@@ -1716,8 +1717,8 @@ mod tests {
             description: "added after save as".into(),
             start: 2,
             end: 3,
-            color: FieldColor::Yellow,
-            background: None,
+            border: Some(FieldColor::Yellow),
+            ..Default::default()
         });
 
         // Reopen original file_a: must still be linked to alpha.bin-overlay-1.json with only alpha_field

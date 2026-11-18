@@ -8,6 +8,7 @@ use std::{
 };
 
 use egui::{Color32, Context, Key, RichText};
+use crate::cli::{LaunchOptions, apply_offset_with_bounds_notice};
 use rex_core::{
     ByteColorMode, CopyFormat, Document, EditKind, SearchMatch, Selection,
     entropy::{self, EntropyMessage, EntropyReport, EntropyWorker},
@@ -82,6 +83,17 @@ impl Default for PythonPanelState {
             starting_rx: None,
             queued_commands: Vec::new(),
         }
+    }
+}
+
+/// Which format a copy shortcut uses: Ctrl+C copies compact hex (`A1B2C3`),
+/// Ctrl+Alt+C spaced hex (`A1 B2 C3`) and Ctrl+Shift+C ASCII.
+fn copy_shortcut_format(pressed: bool, shift: bool, alt: bool) -> Option<CopyFormat> {
+    match (pressed, shift, alt) {
+        (false, _, _) => None,
+        (true, true, _) => Some(CopyFormat::Ascii),
+        (true, false, true) => Some(CopyFormat::HexSpaced),
+        (true, false, false) => Some(CopyFormat::HexCompact),
     }
 }
 
@@ -289,39 +301,6 @@ impl DocumentTab {
     }
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct LaunchOptions {
-    pub paths: Vec<PathBuf>,
-    pub initial_offset: Option<usize>,
-    pub cli_error: Option<String>,
-}
-
-pub fn apply_offset_with_bounds_notice(doc: &mut Document, offset: usize) -> Option<String> {
-    let len = doc.buffer.len();
-    if len == 0 {
-        let msg = format!(
-            "Offset 0x{offset:X} ({offset}) does not exist because '{}' is empty (0 bytes).",
-            doc.file_name()
-        );
-        doc.status = msg.clone();
-        return Some(msg);
-    }
-    if offset >= len {
-        let last = len - 1;
-        doc.select_offset(last, false);
-        let msg = format!(
-            "Offset 0x{offset:X} ({offset}) does not exist in '{}' (file size is {len} bytes / 0x{len:X}); jumped to end of file (0x{last:X}).",
-            doc.file_name()
-        );
-        doc.status = msg.clone();
-        Some(msg)
-    } else {
-        doc.select_offset(offset, false);
-        doc.status = format!("Jumped to offset 0x{offset:X} ({offset})");
-        None
-    }
-}
-
 pub struct RexEditorApp {
     pub tabs: Vec<DocumentTab>,
     pub active_tab: usize,
@@ -346,8 +325,7 @@ impl RexEditorApp {
     pub fn new(initial_paths: Vec<PathBuf>) -> Self {
         Self::new_with_options(LaunchOptions {
             paths: initial_paths,
-            initial_offset: None,
-            cli_error: None,
+            ..Default::default()
         })
     }
 
@@ -632,7 +610,7 @@ impl RexEditorApp {
     }
 
     fn copy_selection_hex(&mut self, ctx: &Context) {
-        self.copy_selection(ctx, CopyFormat::HexSpaced, "spaced hex");
+        self.copy_selection(ctx, CopyFormat::HexCompact, "hex");
     }
 
     fn paste_clipboard_hex(&mut self, pasted_event: Option<String>) {
@@ -891,6 +869,7 @@ impl RexEditorApp {
         }
 
         let mut copy_hex = false;
+        let mut copy_hex_spaced = false;
         let mut copy_ascii = false;
         let mut paste_hex: Option<Option<String>> = None;
         let mut paste_ascii: Option<Option<String>> = None;
@@ -898,13 +877,15 @@ impl RexEditorApp {
         ctx.input(|i| {
             let ctrl = i.modifiers.ctrl || i.modifiers.command;
             let shift = i.modifiers.shift;
+            let alt = i.modifiers.alt;
 
             let copy_event = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
-            if (ctrl && !shift && i.key_pressed(Key::C)) || (!shift && copy_event) {
-                copy_hex = true;
-            }
-            if (ctrl && shift && i.key_pressed(Key::C)) || (shift && copy_event) {
-                copy_ascii = true;
+            let copy_pressed = (ctrl && i.key_pressed(Key::C)) || copy_event;
+            match copy_shortcut_format(copy_pressed, shift, alt) {
+                Some(CopyFormat::HexCompact) => copy_hex = true,
+                Some(CopyFormat::HexSpaced) => copy_hex_spaced = true,
+                Some(CopyFormat::Ascii) => copy_ascii = true,
+                _ => {}
             }
             let pasted_text = i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(text) => Some(text.clone()),
@@ -928,6 +909,10 @@ impl RexEditorApp {
 
         if copy_hex {
             self.copy_selection_hex(ctx);
+            return;
+        }
+        if copy_hex_spaced {
+            self.copy_selection(ctx, CopyFormat::HexSpaced, "spaced hex");
             return;
         }
         if copy_ascii {
@@ -1229,8 +1214,12 @@ impl eframe::App for RexEditorApp {
                     }
                     ui.separator();
                     for (label, fmt, desc) in [
-                        ("Copy Hex (Ctrl+C)", CopyFormat::HexSpaced, "spaced hex"),
-                        ("Copy Compact Hex", CopyFormat::HexCompact, "compact hex"),
+                        ("Copy Hex (Ctrl+C)", CopyFormat::HexCompact, "hex"),
+                        (
+                            "Copy Hex with Spaces (Ctrl+Alt+C)",
+                            CopyFormat::HexSpaced,
+                            "spaced hex",
+                        ),
                         (
                             "Copy ASCII (Ctrl+Shift+C)",
                             CopyFormat::Ascii,
@@ -2251,7 +2240,8 @@ fn render_help_contents(ui: &mut egui::Ui) {
             ("Delete / Backspace", "Delete selected bytes (in Edit Mode)"),
             ("Ctrl + Z / Ctrl + U", "Undo last byte edit"),
             ("Ctrl + Y / Ctrl + R", "Redo last undone byte edit"),
-            ("Ctrl + C", "Copy selected bytes as spaced hexadecimal to clipboard"),
+            ("Ctrl + C", "Copy selected bytes as hexadecimal with no spaces (A1B2C3)"),
+            ("Ctrl + Alt + C", "Copy selected bytes as spaced hexadecimal (A1 B2 C3)"),
             ("Ctrl + Shift + C", "Copy selected bytes as ASCII text to clipboard"),
             ("Ctrl + V", "Paste hexadecimal bytes from clipboard at cursor"),
             ("Ctrl + Shift + V", "Paste ASCII text from clipboard as raw bytes at cursor"),
@@ -2302,4 +2292,17 @@ fn render_help_contents(ui: &mut egui::Ui) {
             ("r", "Run discovered external analysis plugins on the active binary (in View Mode)"),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_shortcuts_pick_compact_hex_by_default() {
+        assert_eq!(copy_shortcut_format(false, false, false), None);
+        assert_eq!(copy_shortcut_format(true, false, false), Some(CopyFormat::HexCompact));
+        assert_eq!(copy_shortcut_format(true, false, true), Some(CopyFormat::HexSpaced));
+        assert_eq!(copy_shortcut_format(true, true, false), Some(CopyFormat::Ascii));
+    }
 }

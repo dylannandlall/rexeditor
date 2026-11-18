@@ -39,10 +39,14 @@ rexeditor/
     │       ├── plugins.rs       # External script/executable inspector plugin discovery & timeout-bounded runner (.exe/.bat/.cmd/.ps1/.py on Windows; chmod +x on Unix)
     │       └── python.rs        # Persistent Python 3 analysis REPL bridge with background warm-up, stdin interrupt thread, multi-document snapshots, and live UpdateSelection sync
     │
-    └── rex-gui/                 # Desktop GUI Workstation (eframe / egui 0.31)
-        ├── Cargo.toml           # Binary target `rexeditor`
+    └── rex-gui/                 # `rexeditor` binary: Desktop GUI (eframe / egui 0.31) + Terminal UI (ratatui 0.30)
+        ├── Cargo.toml           # Binary target `rexeditor`; features `gui` + `tui` (both default)
         └── src/
-            ├── main.rs          # CLI argument parser (`rexeditor [FILEPATH]... [-o|--offset <HEX_OR_DEC>]`) & native eframe launch
+            ├── main.rs          # Picks GUI or TUI (`--tui`, or auto-fallback with no DISPLAY/WAYLAND_DISPLAY), eframe launch
+            ├── cli.rs           # Shared CLI parser (`rexeditor [--tui] [FILEPATH]... [-o|--offset <HEX_OR_DEC>]`), LaunchOptions, offset helper
+            ├── win_console.rs   # Windows: AttachConsole for --help/errors, AllocConsole for --tui in GUI release builds
+            ├── tui/mod.rs       # [tui] TUI state, key/mouse handling, prompts, search polling, OSC 52 copy
+            ├── tui/view.rs      # [tui] Layout (auto bytes-per-row), hex view, inspector, field list, help popup
             ├── app.rs           # RexEditorApp: multi-tab workspace, global shortcuts, top menus (File/Edit/View/Help), Search dock, Python console dock, Split/Diff panes, Jump/Notice/Help modals
             ├── hex_viewport.rs  # Virtualized single-pass painter Hex + ASCII viewport, responsive split-pane scaling, mode badge button, context menu
             ├── sidebar.rs       # Right sidebar (bounded width): Data Inspector (with copy/inline-edit & truncation), Overlay Field Editor, Entropy & Histogram dock
@@ -116,6 +120,13 @@ rexeditor/
 9. **Local Git Repository Initialized (`main` branch):**
    - Initialized `.git` in `c:\Users\dylan\Code\rexeditor` with `.gitignore` and `LICENSE` (MIT), ready to push to GitHub (`https://github.com/dylannandlall/rexeditor.git`).
 
+### ✅ GitHub Issues #1–#6 (branch `claude/jolly-hopper-lwidtv`)
+1. **#3 Hex copy without spaces:** `Ctrl+C` / "Copy Hex" now copies compact hex (`A1B2C3`); `Ctrl+Alt+C` / "Copy Hex with Spaces" copies `A1 B2 C3`.
+2. **#1 Drag-select auto-scroll:** drag selection is tracked at the viewport level (`update_drag_selection` in `hex_viewport.rs`, egui temp-memory flag keyed by viewport id); holding the pointer within ~1.5 rows of (or past) the top/bottom edge scrolls the `ScrollArea` (speed grows with distance). Drags anchor at `press_origin`.
+3. **#2 + #5 Overlay field styles & visibility:** `Field` now has `border`, `text`, `background` (each `Option<FieldColor>`) and `visible: bool`. New fields default to border only (color rotates per field). Legacy overlay JSON (`color` + `background`) still loads via `FieldRepr` (`color` → `border`). Field Editor has three swatch pickers, each with a "no color" swatch; the field list has a visibility checkbox (persisted). Border is drawn as a box around the range in the GUI and as a colored underline in the TUI.
+4. **#4 Inspector interaction:** removed 📋/Edit buttons; single-click a value copies it, double-click an editable value turns it into a text box (Enter writes, Esc/click-away cancels). Plugin results are click-to-copy.
+5. **#6 Headless mode:** `rexeditor --tui` runs a ratatui terminal UI on `rex-core`; GUI builds fall back to it automatically when Linux has no display. TUI-only build: `cargo build --release -p rex-gui --no-default-features --features tui` (no eframe/winit/X11/Wayland deps; console-subsystem on Windows). TUI has hex/ASCII editing, undo/redo, save/save-as, search, jump, inspector (LE/BE), overlay fields (add/rename/delete/show-hide/cycle border-text-background colors), mouse click/drag (edge auto-scroll)/wheel, multiple files, OSC 52 copy, help popup (`?`). Not yet in TUI: entropy, Python console, plugins, split/diff.
+
 ---
 
 ## 4. Future Milestones to Undertake
@@ -130,7 +141,8 @@ rexeditor/
 - **Selection Checksums / Hashes & Byte Transforms in Inspector:**
   - Fast CRC32, MD5, SHA-1, and SHA-256 calculation for the selected byte range directly in the right-hand Data Inspector or a dedicated Hash/Transform tool dialog (e.g., XOR / bit-rotate / Base64 encode-decode on selected bytes).
 
-### 🔜 Milestone 6 — Packaged CLI Option for Integrated Terminal UI (`--tui` / `--cli`)
+### ✅ Milestone 6 (core done via issue #6) — Packaged CLI Option for Integrated Terminal UI (`--tui`)
+- Remaining ideas: entropy/plugins/Python in the TUI.
 - **Integrated TUI Mode in `rexeditor` Binary:**
   - Add a CLI flag (e.g., `rexeditor --tui <filepath>` / `rexeditor --cli <filepath>`, plus automatic fallback if launched in a headless SSH/terminal session with no `DISPLAY`/`WAYLAND_DISPLAY` on Linux) that launches a full-featured Terminal UI (`ratatui` + `crossterm`) powered directly by the shared `rex-core` engine (`Document`, `ByteBuffer`, `SearchWorker`, `EntropyWorker`, `PythonSession`, `InspectorData`, and `Overlay`s).
   - On Windows (`windows_subsystem = "windows"`), dynamically attach/allocate a console (`AttachConsole(ATTACH_PARENT_PROCESS)` / `AllocConsole`) when `--tui`, `--help`, or CLI errors are invoked so a single `rexeditor` executable cleanly supports both native GUI mode (no stray console window on double-click) and full TUI mode in the terminal.
@@ -160,7 +172,7 @@ rexeditor/
 | `Ctrl + F` | Toggle Search Dock open/closed |
 | `Ctrl + G` | Toggle Jump to Offset modal |
 | `Ctrl + H` | Toggle Help & Keybindings scrollable popup |
-| `Ctrl + C` / `Ctrl + Shift + C` | Copy selection as spaced Hex / ASCII |
+| `Ctrl + C` / `Ctrl + Alt + C` / `Ctrl + Shift + C` | Copy selection as Hex (`A1B2C3`) / spaced Hex (`A1 B2 C3`) / ASCII |
 | `Ctrl + V` / `Ctrl + Shift + V` | Paste clipboard as Hex / ASCII |
 | `Ctrl + Z` / `Ctrl + Y` | Undo / Redo byte edit |
 | `i` | Cycle edit mode: `View -> Edit (Overwrite) -> Edit (Insert) -> View` |
