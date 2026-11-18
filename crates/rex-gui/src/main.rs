@@ -22,6 +22,9 @@ mod theme;
 #[cfg(feature = "tui")]
 mod tui;
 
+#[cfg(all(test, feature = "gui"))]
+mod test_support;
+
 #[cfg(windows)]
 mod win_console;
 

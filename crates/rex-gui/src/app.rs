@@ -86,6 +86,17 @@ impl Default for PythonPanelState {
     }
 }
 
+/// Which format a copy shortcut uses: Ctrl+C copies compact hex (`A1B2C3`),
+/// Ctrl+Alt+C spaced hex (`A1 B2 C3`) and Ctrl+Shift+C ASCII.
+fn copy_shortcut_format(pressed: bool, shift: bool, alt: bool) -> Option<CopyFormat> {
+    match (pressed, shift, alt) {
+        (false, _, _) => None,
+        (true, true, _) => Some(CopyFormat::Ascii),
+        (true, false, true) => Some(CopyFormat::HexSpaced),
+        (true, false, false) => Some(CopyFormat::HexCompact),
+    }
+}
+
 fn python_continuation_indentation(line: &str) -> String {
     let leading_spaces = line.chars().take_while(|&c| c == ' ').count();
     if line.trim_end().ends_with(':') {
@@ -870,14 +881,11 @@ impl RexEditorApp {
 
             let copy_event = i.events.iter().any(|e| matches!(e, egui::Event::Copy));
             let copy_pressed = (ctrl && i.key_pressed(Key::C)) || copy_event;
-            if copy_pressed {
-                if alt && !shift {
-                    copy_hex_spaced = true;
-                } else if shift {
-                    copy_ascii = true;
-                } else {
-                    copy_hex = true;
-                }
+            match copy_shortcut_format(copy_pressed, shift, alt) {
+                Some(CopyFormat::HexCompact) => copy_hex = true,
+                Some(CopyFormat::HexSpaced) => copy_hex_spaced = true,
+                Some(CopyFormat::Ascii) => copy_ascii = true,
+                _ => {}
             }
             let pasted_text = i.events.iter().find_map(|e| match e {
                 egui::Event::Paste(text) => Some(text.clone()),
@@ -2284,4 +2292,17 @@ fn render_help_contents(ui: &mut egui::Ui) {
             ("r", "Run discovered external analysis plugins on the active binary (in View Mode)"),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_shortcuts_pick_compact_hex_by_default() {
+        assert_eq!(copy_shortcut_format(false, false, false), None);
+        assert_eq!(copy_shortcut_format(true, false, false), Some(CopyFormat::HexCompact));
+        assert_eq!(copy_shortcut_format(true, false, true), Some(CopyFormat::HexSpaced));
+        assert_eq!(copy_shortcut_format(true, true, false), Some(CopyFormat::Ascii));
+    }
 }

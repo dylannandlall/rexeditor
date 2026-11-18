@@ -5,7 +5,7 @@
 //! a single hit-test map pointer positions to either the Hex or ASCII column.
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
-use rex_core::{ByteBuffer, CopyFormat, DisplayRow, Document, EditKind, SearchMatch};
+use rex_core::{ByteBuffer, CopyFormat, DisplayRow, Document, EditKind, Field, SearchMatch};
 
 use crate::theme::{byte_color32, field_color32, hex_byte_str, named_color32};
 
@@ -98,12 +98,25 @@ impl Layout {
 }
 
 /// Which sides of a byte cell lie on the outside of its field's range.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BorderEdges {
     top: bool,
     bottom: bool,
     left: bool,
     right: bool,
+}
+
+impl BorderEdges {
+    /// Edges of the byte at `abs` (column `i` of a row holding `count` bytes, `bpr`
+    /// per row) that face outside `field`, i.e. where its border must be drawn.
+    fn for_byte(field: &Field, abs: usize, i: usize, count: usize, bpr: usize) -> Self {
+        Self {
+            top: abs < bpr || !field.contains(abs - bpr),
+            bottom: !field.contains(abs + bpr),
+            left: i == 0 || !field.contains(abs - 1),
+            right: i + 1 == count || !field.contains(abs + 1),
+        }
+    }
 }
 
 fn paint_border(painter: &egui::Painter, cell: Rect, edges: BorderEdges, stroke: Stroke) {
@@ -459,12 +472,7 @@ pub fn render_hex_viewport(
                                 && let Some(border) = f.border
                             {
                                 let stroke = Stroke::new(1.5_f32, field_color32(border));
-                                let edges = BorderEdges {
-                                    top: abs < bpr || !f.contains(abs - bpr),
-                                    bottom: !f.contains(abs + bpr),
-                                    left: i == 0 || !f.contains(abs - 1),
-                                    right: i + 1 == count || !f.contains(abs + 1),
-                                };
+                                let edges = BorderEdges::for_byte(f, abs, i, count, bpr);
                                 // Extend top/bottom lines across the gap to the next cell
                                 // so a multi-byte border reads as one continuous box.
                                 let hex_span_right = if edges.right {
@@ -758,5 +766,192 @@ fn update_drag_selection(
     {
         sel.cursor = target;
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{Harness, find_text};
+    use egui::{FullOutput, Shape};
+    use rex_core::FieldColor;
+
+    fn field(start: usize, end: usize) -> Field {
+        Field {
+            name: "f".into(),
+            start,
+            end,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn border_edges_outline_a_multi_row_field() {
+        let f = field(4, 20);
+        let edges = |abs: usize, count: usize| BorderEdges::for_byte(&f, abs, abs % 16, count, 16);
+        // First byte: top and left edges only.
+        assert_eq!(
+            edges(4, 16),
+            BorderEdges { top: true, bottom: false, left: true, right: false }
+        );
+        // End of the first row: the row break closes the right side.
+        assert_eq!(
+            edges(15, 16),
+            BorderEdges { top: true, bottom: true, left: false, right: true }
+        );
+        // Start of the second row opens on the left.
+        assert_eq!(
+            edges(16, 16),
+            BorderEdges { top: true, bottom: true, left: true, right: false }
+        );
+        // Last byte: below it and to its right are outside the field.
+        assert_eq!(
+            edges(20, 16),
+            BorderEdges { top: false, bottom: true, left: false, right: true }
+        );
+        // Last byte of a short final row closes on the right.
+        assert!(BorderEdges::for_byte(&field(0, 100), 17, 1, 2, 16).right);
+    }
+
+    fn draw(h: &mut Harness, doc: &mut Document, column: &mut EditColumn) -> FullOutput {
+        let mut add = false;
+        h.frame(|ui| render_hex_viewport(ui, "hex_viewport_primary", doc, &[], None, column, &mut add))
+    }
+
+    /// Stroke, fill and text colors used in a frame.
+    fn colors(out: &FullOutput) -> (Vec<Color32>, Vec<Color32>, Vec<Color32>) {
+        let (mut lines, mut fills, mut texts) = (Vec::new(), Vec::new(), Vec::new());
+        for clipped in &out.shapes {
+            match &clipped.shape {
+                Shape::LineSegment { stroke, .. } => lines.push(stroke.color),
+                Shape::Rect(r) => fills.push(r.fill),
+                Shape::Text(t) => texts.extend(t.galley.job.sections.iter().map(|s| s.format.color)),
+                _ => {}
+            }
+        }
+        (lines, fills, texts)
+    }
+
+    #[test]
+    fn field_border_text_and_background_are_drawn_only_while_visible() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0x41; 64]);
+        doc.select_offset(40, false);
+        doc.add_field(Field {
+            border: Some(FieldColor::Red),
+            text: Some(FieldColor::Green),
+            background: Some(FieldColor::Blue),
+            ..field(2, 5)
+        });
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 400.0);
+        draw(&mut h, &mut doc, &mut column);
+        let (lines, fills, texts) = colors(&draw(&mut h, &mut doc, &mut column));
+        let red = field_color32(FieldColor::Red);
+        let green = field_color32(FieldColor::Green);
+        let blue_bg = field_color32(FieldColor::Blue).gamma_multiply(0.45);
+        assert!(lines.contains(&red), "border should be drawn");
+        assert!(texts.contains(&green), "text color should be used");
+        assert!(fills.contains(&blue_bg), "background should be filled");
+
+        doc.fields[0].visible = false;
+        let (lines, fills, texts) = colors(&draw(&mut h, &mut doc, &mut column));
+        assert!(!lines.contains(&red));
+        assert!(!texts.contains(&green));
+        assert!(!fills.contains(&blue_bg));
+    }
+
+    #[test]
+    fn border_only_field_leaves_text_and_background_alone() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0x41; 64]);
+        doc.add_field(Field {
+            border: Some(FieldColor::Magenta),
+            ..field(2, 5)
+        });
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 400.0);
+        draw(&mut h, &mut doc, &mut column);
+        let (lines, fills, texts) = colors(&draw(&mut h, &mut doc, &mut column));
+        let magenta = field_color32(FieldColor::Magenta);
+        assert!(lines.contains(&magenta));
+        assert!(!texts.contains(&magenta));
+        assert!(!fills.iter().any(|c| *c == magenta.gamma_multiply(0.45)));
+    }
+
+    /// Position of byte `col` on the row whose offset label reads `label`.
+    fn byte_pos(out: &FullOutput, label: &str, col: usize) -> Pos2 {
+        let r = find_text(out, label).unwrap_or_else(|| panic!("row {label} not drawn"));
+        let char_w = r.width() / label.len() as f32;
+        // Offsets take 10 columns; each byte 3; +1 for centre of the first digit.
+        Pos2::new(r.left() + (10 + 3 * col) as f32 * char_w + char_w, r.center().y)
+    }
+
+    #[test]
+    fn dragging_past_the_bottom_edge_scrolls_and_extends_selection() {
+        let mut doc = Document::from_bytes("t.bin".into(), (0..16 * 400).map(|i| i as u8).collect());
+        doc.select_offset(0, false);
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 420.0);
+        draw(&mut h, &mut doc, &mut column);
+        let out = draw(&mut h, &mut doc, &mut column);
+        assert_eq!(doc.scroll, 0);
+
+        let start = byte_pos(&out, "00000030", 2);
+        h.press(start);
+        draw(&mut h, &mut doc, &mut column);
+        // The first move crosses into the next byte before egui recognises the drag.
+        for delta in [Vec2::new(30.0, 0.0), Vec2::new(30.0, 40.0), Vec2::new(0.0, 120.0)] {
+            h.move_to(start + delta);
+            draw(&mut h, &mut doc, &mut column);
+        }
+        assert_eq!(doc.selection.unwrap().anchor, 0x32, "drag anchors where it was pressed");
+        assert_eq!(doc.scroll, 0, "no scrolling away from the edges");
+
+        // Hold the pointer below the viewport.
+        h.move_to(Pos2::new(start.x, 418.0));
+        for _ in 0..40 {
+            draw(&mut h, &mut doc, &mut column);
+        }
+        let scrolled = doc.scroll;
+        assert!(scrolled > 5, "viewport should auto-scroll down, scroll = {scrolled}");
+        let sel = doc.selection.unwrap();
+        assert_eq!(sel.anchor, 0x32);
+        assert!(sel.cursor / 16 >= scrolled, "selection follows the scrolled rows");
+
+        // Releasing stops the auto-scroll.
+        h.release(Pos2::new(start.x, 418.0));
+        draw(&mut h, &mut doc, &mut column);
+        let after_release = doc.scroll;
+        for _ in 0..10 {
+            draw(&mut h, &mut doc, &mut column);
+        }
+        assert_eq!(doc.scroll, after_release);
+    }
+
+    #[test]
+    fn dragging_past_the_top_edge_scrolls_up() {
+        let mut doc = Document::from_bytes("t.bin".into(), (0..16 * 400).map(|i| i as u8).collect());
+        doc.select_offset(16 * 200, false);
+        let mut column = EditColumn::Hex;
+        let mut h = Harness::new(900.0, 420.0);
+        draw(&mut h, &mut doc, &mut column);
+        let out = draw(&mut h, &mut doc, &mut column);
+        let top_row = doc.scroll;
+        assert!(top_row > 100);
+
+        let label = format!("{:08X}", (top_row + 6) * 16);
+        let start = byte_pos(&out, &label, 0);
+        h.press(start);
+        draw(&mut h, &mut doc, &mut column);
+        h.move_to(start - Vec2::new(0.0, 20.0));
+        draw(&mut h, &mut doc, &mut column);
+        h.move_to(Pos2::new(start.x, 2.0));
+        for _ in 0..40 {
+            draw(&mut h, &mut doc, &mut column);
+        }
+        assert!(doc.scroll + 5 < top_row, "viewport should auto-scroll up");
+        let sel = doc.selection.unwrap();
+        assert!(sel.cursor < sel.anchor);
+        h.release(Pos2::new(start.x, 2.0));
+        draw(&mut h, &mut doc, &mut column);
     }
 }

@@ -935,3 +935,187 @@ fn render_help(frame: &mut Frame, app: &App) {
         popup,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::LaunchOptions;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    fn app_with(bytes: Vec<u8>) -> App {
+        let mut app = App::new(LaunchOptions::default());
+        app.truecolor = false;
+        let mut doc = Document::from_bytes("t.bin".into(), bytes);
+        doc.select_offset(0x30, false);
+        app.tabs.push(Tab::new(doc));
+        app
+    }
+
+    fn draw(app: &mut App, w: u16, h: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        app.prepare_frame(Rect::new(0, 0, w, h));
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Screen cell of the high hex digit of byte `col` on hex-view row `row`.
+    fn hex_cell(app: &App, buf: &Buffer, row: u16, col: usize) -> ratatui::buffer::Cell {
+        let geo = app.hex_geo;
+        let x = geo.area.x + HexGeometry::hex_x(geo.off_w, col);
+        buf[(x, geo.area.y + row)].clone()
+    }
+
+    #[test]
+    fn layout_fits_bytes_per_row_and_panel_to_the_terminal() {
+        let mut app = app_with(vec![0; 256]);
+        let wide = compute_layout(&app, Rect::new(0, 0, 130, 30));
+        assert_eq!(wide.geometry.bpr, 16);
+        assert!(wide.panel.is_some());
+
+        let classic = compute_layout(&app, Rect::new(0, 0, 80, 24));
+        assert_eq!(
+            classic.geometry.bpr, 16,
+            "80 columns keeps 16 bytes and drops the panel"
+        );
+        assert!(classic.panel.is_none());
+
+        let narrow = compute_layout(&app, Rect::new(0, 0, 50, 24));
+        assert_eq!(narrow.geometry.bpr, 8);
+
+        let huge = compute_layout(&app, Rect::new(0, 0, 250, 30));
+        assert_eq!(huge.geometry.bpr, 32);
+
+        app.show_panel = false;
+        assert!(
+            compute_layout(&app, Rect::new(0, 0, 130, 30))
+                .panel
+                .is_none()
+        );
+
+        app.manual_bpr = Some(8);
+        assert_eq!(
+            compute_layout(&app, Rect::new(0, 0, 130, 30)).geometry.bpr,
+            8
+        );
+    }
+
+    #[test]
+    fn rows_show_offsets_hex_and_ascii() {
+        let mut app = app_with(b"Hello, world!\0\x01\x7f".to_vec());
+        let buf = draw(&mut app, 100, 10);
+        let geo = app.hex_geo;
+        let row: String = (geo.area.x..geo.area.x + HexGeometry::width(geo.off_w, 16))
+            .map(|x| buf[(x, geo.area.y)].symbol().to_string())
+            .collect();
+        assert!(
+            row.starts_with("00000000  48 65 6C 6C 6F 2C 20 77  6F"),
+            "{row}"
+        );
+        assert!(row.ends_with("Hello, world!..."), "{row}");
+    }
+
+    #[test]
+    fn field_styles_map_to_terminal_attributes() {
+        let mut app = app_with(vec![0x41; 64]);
+        let doc = &mut app.tabs[0].doc;
+        doc.add_field(Field {
+            name: "border".into(),
+            start: 0,
+            end: 1,
+            border: Some(FieldColor::Red),
+            ..Field::default()
+        });
+        doc.add_field(Field {
+            name: "styled".into(),
+            start: 4,
+            end: 5,
+            border: None,
+            text: Some(FieldColor::Green),
+            background: Some(FieldColor::Blue),
+            ..Field::default()
+        });
+        let buf = draw(&mut app, 120, 12);
+
+        let border = hex_cell(&app, &buf, 0, 0);
+        assert!(border.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(border.underline_color, Color::Red);
+        // The gap between two bytes of one field continues the underline.
+        let geo = app.hex_geo;
+        let gap = &buf[(
+            geo.area.x + HexGeometry::hex_x(geo.off_w, 0) + 2,
+            geo.area.y,
+        )];
+        assert!(gap.modifier.contains(Modifier::UNDERLINED));
+
+        let styled = hex_cell(&app, &buf, 0, 4);
+        assert_eq!(styled.fg, Color::Green);
+        assert_eq!(styled.bg, Color::Blue);
+        assert!(!styled.modifier.contains(Modifier::UNDERLINED));
+
+        let plain = hex_cell(&app, &buf, 0, 8);
+        assert!(!plain.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(plain.bg, Color::Reset);
+    }
+
+    #[test]
+    fn hidden_fields_are_not_styled() {
+        let mut app = app_with(vec![0x41; 64]);
+        app.tabs[0].doc.add_field(Field {
+            name: "f".into(),
+            start: 0,
+            end: 3,
+            background: Some(FieldColor::Magenta),
+            visible: false,
+            ..Field::default()
+        });
+        let buf = draw(&mut app, 120, 12);
+        let cell = hex_cell(&app, &buf, 0, 1);
+        assert!(!cell.modifier.contains(Modifier::UNDERLINED));
+        assert_ne!(cell.bg, Color::Magenta);
+    }
+
+    #[test]
+    fn selection_and_cursor_are_highlighted() {
+        let mut app = app_with(vec![0; 64]);
+        let doc = &mut app.tabs[0].doc;
+        doc.select_offset(0x10, false);
+        doc.select_offset(0x12, true);
+        let buf = draw(&mut app, 120, 12);
+        assert_eq!(hex_cell(&app, &buf, 1, 0).bg, Color::Blue);
+        assert!(
+            hex_cell(&app, &buf, 1, 2)
+                .modifier
+                .contains(Modifier::REVERSED),
+            "cursor"
+        );
+        assert_eq!(hex_cell(&app, &buf, 1, 3).bg, Color::Reset);
+    }
+
+    #[test]
+    fn rendering_never_panics_on_tiny_or_empty_screens() {
+        for (w, h) in [(1, 1), (10, 3), (20, 5), (40, 8), (79, 24)] {
+            let mut app = app_with(vec![0; 300]);
+            app.show_help = true;
+            draw(&mut app, w, h);
+            app.show_help = false;
+            app.tabs[0].doc.add_field(Field {
+                name: "f".into(),
+                end: 4,
+                ..Field::default()
+            });
+            draw(&mut app, w, h);
+            let mut empty = App::new(LaunchOptions::default());
+            draw(&mut empty, w, h);
+        }
+    }
+
+    #[test]
+    fn welcome_screen_when_no_file_is_open() {
+        let mut app = App::new(LaunchOptions::default());
+        let buf = draw(&mut app, 60, 12);
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("No file is open."));
+    }
+}

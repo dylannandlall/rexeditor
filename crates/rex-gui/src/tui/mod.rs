@@ -1379,6 +1379,227 @@ mod tests {
         assert_eq!(app.pending_clipboard.as_deref(), Some("A1 B2 C3"));
     }
 
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Screen position of byte `col` on hex-view row `row`.
+    fn byte_at(app: &App, row: u16, col: usize) -> (u16, u16) {
+        let geo = app.hex_geo;
+        (
+            geo.area.x + HexGeometry::hex_x(geo.off_w, col),
+            geo.area.y + row,
+        )
+    }
+
+    #[test]
+    fn click_selects_and_drag_extends() {
+        let mut app = app_with(vec![0; 1024]);
+        let (x, y) = byte_at(&app, 2, 3);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        assert_eq!(app.tab().unwrap().doc.selection.unwrap().cursor, 0x23);
+        let (x2, y2) = byte_at(&app, 4, 1);
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), x2, y2));
+        let sel = app.tab().unwrap().doc.selection.unwrap();
+        assert_eq!((sel.anchor, sel.cursor), (0x23, 0x41));
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), x2, y2));
+        assert!(app.drag.is_none());
+
+        // Clicking the ASCII column switches the active column.
+        let geo = app.hex_geo;
+        let ax = geo.area.x + HexGeometry::ascii_x(geo.off_w, geo.bpr, 5);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ax,
+            geo.area.y,
+        ));
+        assert_eq!(app.tab().unwrap().column, Column::Ascii);
+        assert_eq!(app.tab().unwrap().doc.selection.unwrap().cursor, 5);
+    }
+
+    #[test]
+    fn holding_a_drag_past_the_bottom_edge_keeps_scrolling() {
+        let mut app = app_with(vec![0; 16 * 500]);
+        let (x, y) = byte_at(&app, 1, 0);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        let geo = app.hex_geo;
+        let below = geo.area.y + geo.area.height + 1;
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), x, below));
+        let first = app.tab().unwrap().doc.scroll;
+        assert!(first > 0);
+        // No further mouse events: idle ticks continue the auto-scroll.
+        for _ in 0..10 {
+            assert!(app.tick());
+        }
+        let doc = &app.tab().unwrap().doc;
+        assert!(doc.scroll > first + 5);
+        let sel = doc.selection.unwrap();
+        assert_eq!(sel.anchor, 0x10);
+        assert!(sel.cursor / 16 >= doc.scroll);
+
+        app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), x, below));
+        assert!(!app.tick(), "releasing stops auto-scroll");
+
+        // Wheel scrolling moves the view without moving the cursor.
+        let state = |app: &App| {
+            let doc = &app.tab().unwrap().doc;
+            (doc.selection, doc.scroll)
+        };
+        let before = state(&app);
+        app.handle_event(mouse(MouseEventKind::ScrollUp, x, y));
+        let after = state(&app);
+        assert_eq!(after.0, before.0);
+        assert_eq!(after.1 + 3, before.1);
+    }
+
+    #[test]
+    fn dragging_past_the_top_edge_scrolls_up() {
+        let mut app = app_with(vec![0; 16 * 500]);
+        app.tabs[0].doc.select_offset(16 * 300, false);
+        app.prepare_frame(Rect::new(0, 0, 120, 30));
+        let start_scroll = app.tab().unwrap().doc.scroll;
+        let (x, y) = byte_at(&app, 5, 0);
+        app.handle_event(mouse(MouseEventKind::Down(MouseButton::Left), x, y));
+        app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), x, 0));
+        for _ in 0..10 {
+            app.tick();
+        }
+        assert!(app.tab().unwrap().doc.scroll + 10 < start_scroll);
+    }
+
+    #[test]
+    fn clicking_a_field_checkbox_toggles_visibility() {
+        let mut app = app_with(vec![0; 64]);
+        app.tabs[0].doc.add_field(Field {
+            name: "magic".into(),
+            end: 3,
+            ..Field::default()
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 30)).unwrap();
+        app.prepare_frame(Rect::new(0, 0, 130, 30));
+        terminal.draw(|f| view::render(f, &mut app)).unwrap();
+        let list = app.fields_geo.area;
+        assert!(list.width > 0, "field list is drawn");
+
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            list.x + 1,
+            list.y,
+        ));
+        assert!(!app.tab().unwrap().doc.fields[0].visible);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            list.x + 1,
+            list.y,
+        ));
+        assert!(app.tab().unwrap().doc.fields[0].visible);
+
+        // Clicking the name selects the field's bytes instead.
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            list.x + 10,
+            list.y,
+        ));
+        let sel = app.tab().unwrap().doc.selection.unwrap();
+        assert_eq!((sel.start(), sel.end()), (0, 3));
+        assert_eq!(app.focus, Focus::Fields);
+    }
+
+    #[test]
+    fn color_cycling_passes_through_no_color() {
+        let mut app = app_with(vec![0; 64]);
+        app.tabs[0].doc.add_field(Field {
+            name: "f".into(),
+            end: 1,
+            border: Some(FieldColor::ALL[FieldColor::ALL.len() - 1]),
+            ..Field::default()
+        });
+        type_str(&mut app, "f");
+        type_str(&mut app, "b");
+        assert_eq!(
+            app.tab().unwrap().doc.fields[0].border,
+            None,
+            "after the last color comes none"
+        );
+        type_str(&mut app, "b");
+        assert_eq!(
+            app.tab().unwrap().doc.fields[0].border,
+            Some(FieldColor::ALL[0])
+        );
+        type_str(&mut app, "cC");
+        assert_eq!(app.tab().unwrap().doc.fields[0].background, None);
+    }
+
+    #[test]
+    fn paste_requires_edit_mode_and_respects_column() {
+        let mut app = app_with(vec![0; 16]);
+        app.handle_event(Event::Paste("DE AD".into()));
+        assert_eq!(app.tab().unwrap().doc.buffer.get(0), Some(0));
+        type_str(&mut app, "i");
+        app.handle_event(Event::Paste("DE AD".into()));
+        assert_eq!(app.tab().unwrap().doc.buffer.get(0), Some(0xDE));
+        assert_eq!(app.tab().unwrap().doc.buffer.get(1), Some(0xAD));
+    }
+
+    #[test]
+    fn modifier_chords_are_not_typed_into_the_file() {
+        let mut app = app_with(vec![0; 16]);
+        type_str(&mut app, "i");
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+        assert_eq!(app.tab().unwrap().doc.buffer.get(0), Some(0));
+        assert!(!app.tab().unwrap().doc.is_dirty());
+    }
+
+    #[test]
+    fn search_prompt_finds_and_steps_through_matches() {
+        let mut app = app_with(b"..AB..AB..AB....".to_vec());
+        type_str(&mut app, "/");
+        type_str(&mut app, "text:AB");
+        app.handle_key(key(KeyCode::Enter));
+        for _ in 0..200 {
+            app.tabs[0].poll_search();
+            if !app.tabs[0].search.running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let tab = app.tab().unwrap();
+        assert_eq!(tab.search.matches.len(), 3);
+        assert_eq!(tab.doc.selection.unwrap().start(), 2);
+        type_str(&mut app, "n");
+        assert_eq!(app.tab().unwrap().doc.selection.unwrap().start(), 6);
+        type_str(&mut app, "N");
+        type_str(&mut app, "N");
+        assert_eq!(
+            app.tab().unwrap().doc.selection.unwrap().start(),
+            10,
+            "wraps backwards"
+        );
+    }
+
+    #[test]
+    fn line_input_edits_like_a_shell_prompt() {
+        let mut input = LineInput::with_text("0x1234".into());
+        input.handle_key(key(KeyCode::Backspace));
+        assert_eq!(input.text, "0x123");
+        input.handle_key(key(KeyCode::Home));
+        input.handle_key(key(KeyCode::Delete));
+        input.handle_key(key(KeyCode::Right));
+        input.handle_key(key(KeyCode::Char('Z')));
+        assert_eq!(input.text, "xZ123");
+        input.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(input.text, "123");
+        input.insert_str("é\n");
+        assert_eq!(input.text, "é123", "control characters are dropped");
+    }
+
     #[test]
     fn quitting_with_unsaved_changes_needs_confirmation() {
         let mut app = app_with(vec![0; 8]);

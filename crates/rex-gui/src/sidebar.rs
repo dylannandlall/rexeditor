@@ -63,7 +63,7 @@ fn truncate_display(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// Renders one inspector row.
+/// Renders one inspector row and returns the value widget's response.
 ///
 /// Clicking the value copies it to the clipboard. When `kind` is `Some`, double-clicking
 /// turns the value into a text box: Enter writes the new value, Esc or clicking away
@@ -76,10 +76,10 @@ fn value_row(
     label: &str,
     value: &str,
     kind: Option<&str>,
-) {
+) -> egui::Response {
     ui.label(label);
     let editing = kind.is_some() && state.editing_kind.as_deref() == kind;
-    if editing {
+    let resp = if editing {
         let resp = ui.add(
             egui::TextEdit::singleline(&mut state.edit_buffer)
                 .font(egui::TextStyle::Monospace)
@@ -105,6 +105,7 @@ fn value_row(
             }
             state.editing_kind = None;
         }
+        resp
     } else {
         let copyable = value != "-" && !value.is_empty();
         let display = truncate_display(value, 22);
@@ -132,8 +133,10 @@ fn value_row(
             copy_to_clipboard(ui, value);
             doc.status = format!("Copied {label}: {display}");
         }
-    }
+        resp
+    };
     ui.end_row();
+    resp
 }
 
 /// A monospace value that behaves like a read-only text box: it highlights on hover
@@ -733,4 +736,178 @@ pub fn render_entropy_panel(
             );
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{Harness, copied_text, find_text};
+    use egui::{FullOutput, Pos2};
+
+    fn inspector_frame(
+        h: &mut Harness,
+        doc: &mut Document,
+        state: &mut InspectorUiState,
+        value: &str,
+        kind: Option<&str>,
+    ) -> (FullOutput, egui::Rect) {
+        let mut rect = egui::Rect::NOTHING;
+        let out = h.frame(|ui| {
+            egui::Grid::new("g").show(ui, |ui| {
+                rect = value_row(ui, doc, state, 0, "u8", value, kind).rect;
+            });
+        });
+        (out, rect)
+    }
+
+    fn click(h: &mut Harness, doc: &mut Document, state: &mut InspectorUiState, at: Pos2, value: &str, kind: Option<&str>) -> Option<String> {
+        h.press(at);
+        let (a, _) = inspector_frame(h, doc, state, value, kind);
+        h.release(at);
+        let (b, _) = inspector_frame(h, doc, state, value, kind);
+        copied_text(&a).or_else(|| copied_text(&b))
+    }
+
+    fn setup() -> (Harness, Document, InspectorUiState) {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![68, 0, 0, 0]);
+        doc.select_offset(0, false);
+        (Harness::new(500.0, 200.0), doc, InspectorUiState::default())
+    }
+
+    #[test]
+    fn single_click_copies_the_value() {
+        let (mut h, mut doc, mut state) = setup();
+        let (_, rect) = inspector_frame(&mut h, &mut doc, &mut state, "68", Some("u8"));
+        let copied = click(&mut h, &mut doc, &mut state, rect.center(), "68", Some("u8"));
+        assert_eq!(copied.as_deref(), Some("68"));
+        assert!(doc.status.starts_with("Copied u8"), "{}", doc.status);
+        assert!(state.editing_kind.is_none(), "a single click does not start editing");
+    }
+
+    #[test]
+    fn placeholder_values_are_not_copied() {
+        let (mut h, mut doc, mut state) = setup();
+        let (_, rect) = inspector_frame(&mut h, &mut doc, &mut state, "-", None);
+        assert_eq!(click(&mut h, &mut doc, &mut state, rect.center(), "-", None), None);
+    }
+
+    fn start_edit(h: &mut Harness, doc: &mut Document, state: &mut InspectorUiState) {
+        let (_, rect) = inspector_frame(h, doc, state, "68", Some("u8"));
+        click(h, doc, state, rect.center(), "68", Some("u8"));
+        click(h, doc, state, rect.center(), "68", Some("u8"));
+        assert_eq!(state.editing_kind.as_deref(), Some("u8"), "double-click starts editing");
+        assert_eq!(state.edit_buffer, "68");
+        // Next frame shows the focused text box.
+        inspector_frame(h, doc, state, "68", Some("u8"));
+    }
+
+    #[test]
+    fn double_click_edits_and_enter_writes() {
+        let (mut h, mut doc, mut state) = setup();
+        start_edit(&mut h, &mut doc, &mut state);
+        state.edit_buffer = "255".into();
+        h.key(egui::Key::Enter);
+        inspector_frame(&mut h, &mut doc, &mut state, "68", Some("u8"));
+        assert_eq!(doc.buffer.get(0), Some(255));
+        assert!(state.editing_kind.is_none());
+    }
+
+    #[test]
+    fn escape_cancels_an_edit() {
+        let (mut h, mut doc, mut state) = setup();
+        start_edit(&mut h, &mut doc, &mut state);
+        state.edit_buffer = "1".into();
+        h.key(egui::Key::Escape);
+        inspector_frame(&mut h, &mut doc, &mut state, "68", Some("u8"));
+        assert_eq!(doc.buffer.get(0), Some(68));
+        assert!(state.editing_kind.is_none());
+    }
+
+    #[test]
+    fn read_only_values_ignore_double_click() {
+        let (mut h, mut doc, mut state) = setup();
+        let (_, rect) = inspector_frame(&mut h, &mut doc, &mut state, "68", None);
+        click(&mut h, &mut doc, &mut state, rect.center(), "68", None);
+        click(&mut h, &mut doc, &mut state, rect.center(), "68", None);
+        assert!(state.editing_kind.is_none());
+    }
+
+    #[test]
+    fn new_fields_default_to_a_rotating_border_only() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0; 16]);
+        doc.select_offset(2, false);
+        let mut editor = FieldEditorState::default();
+        editor.begin_add_for_selection(&doc);
+        assert_eq!(editor.border, Some(FieldColor::ALL[0]));
+        assert_eq!((editor.text, editor.background), (None, None));
+        assert!(editor.visible);
+
+        doc.add_field(Field::default());
+        editor.begin_add_for_selection(&doc);
+        assert_eq!(editor.border, Some(FieldColor::ALL[1]));
+    }
+
+    fn fields_frame(h: &mut Harness, doc: &mut Document, editor: &mut FieldEditorState) -> FullOutput {
+        h.frame(|ui| render_fields_panel(ui, doc, editor))
+    }
+
+    fn click_at(h: &mut Harness, doc: &mut Document, editor: &mut FieldEditorState, at: Pos2) -> FullOutput {
+        h.press(at);
+        fields_frame(h, doc, editor);
+        h.release(at);
+        fields_frame(h, doc, editor)
+    }
+
+    #[test]
+    fn editor_can_clear_border_and_pick_text_and_background() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0; 16]);
+        doc.select_offset(2, false);
+        let mut editor = FieldEditorState::default();
+        editor.begin_add_for_selection(&doc);
+        let mut h = Harness::new(420.0, 700.0);
+        fields_frame(&mut h, &mut doc, &mut editor);
+        let out = fields_frame(&mut h, &mut doc, &mut editor);
+
+        // Each picker row starts with the "no color" swatch, followed by the colors.
+        let swatch = |out: &FullOutput, label: &str, index: usize| {
+            let r = find_text(out, label).unwrap_or_else(|| panic!("{label} not drawn"));
+            Pos2::new(r.left() + 8.0 + index as f32 * 20.0, r.bottom() + 12.0)
+        };
+        let out = click_at(&mut h, &mut doc, &mut editor, swatch(&out, "Border Color", 0));
+        assert_eq!(editor.border, None);
+        let out = click_at(&mut h, &mut doc, &mut editor, swatch(&out, "Text Color", 2));
+        assert_eq!(editor.text, Some(FieldColor::ALL[1]));
+        let out = click_at(&mut h, &mut doc, &mut editor, swatch(&out, "Background Color", 3));
+        assert_eq!(editor.background, Some(FieldColor::ALL[2]));
+
+        let save = find_text(&out, "Save").expect("Save button").center();
+        click_at(&mut h, &mut doc, &mut editor, save);
+        assert_eq!(doc.fields.len(), 1);
+        let f = &doc.fields[0];
+        assert_eq!((f.border, f.text, f.background), (None, Some(FieldColor::ALL[1]), Some(FieldColor::ALL[2])));
+        assert!(f.visible);
+    }
+
+    #[test]
+    fn field_list_checkbox_toggles_visibility() {
+        let mut doc = Document::from_bytes("t.bin".into(), vec![0; 16]);
+        doc.add_field(Field {
+            name: "magic".into(),
+            start: 0,
+            end: 3,
+            ..Default::default()
+        });
+        let mut editor = FieldEditorState::default();
+        let mut h = Harness::new(420.0, 400.0);
+        fields_frame(&mut h, &mut doc, &mut editor);
+        let out = fields_frame(&mut h, &mut doc, &mut editor);
+        let label = find_text(&out, "magic").expect("field row");
+        // The checkbox is the first widget on the row, at the panel's left edge.
+        let checkbox = Pos2::new(16.0, label.center().y);
+
+        click_at(&mut h, &mut doc, &mut editor, checkbox);
+        assert!(!doc.fields[0].visible);
+        click_at(&mut h, &mut doc, &mut editor, checkbox);
+        assert!(doc.fields[0].visible);
+    }
 }
