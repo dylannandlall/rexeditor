@@ -13,6 +13,8 @@ mod cli;
 #[cfg(feature = "gui")]
 mod app;
 #[cfg(feature = "gui")]
+mod clipboard;
+#[cfg(feature = "gui")]
 mod hex_viewport;
 #[cfg(feature = "gui")]
 mod sidebar;
@@ -94,26 +96,36 @@ fn run_gui(options: LaunchOptions) -> ExitCode {
         ..Default::default()
     };
 
+    // Set once the window is up. Only a window that never opened falls back to the
+    // TUI; an error after that (e.g. the display connection dropping) is reported, not
+    // papered over with a different interface.
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started_flag = started.clone();
     let result = eframe::run_native(
         "RexEditor",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(app::RexEditorApp::new_with_options(options)))),
+        Box::new(move |_cc| {
+            started_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(app::RexEditorApp::new_with_options(options)))
+        }),
     );
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            #[cfg(windows)]
-            win_console::attach_parent();
-            eprintln!("rexeditor: could not start the graphical window: {err}");
-            #[cfg(feature = "tui")]
-            {
-                eprintln!("rexeditor: falling back to the terminal UI");
-                return run_tui(fallback);
-            }
-            #[allow(unreachable_code)]
-            ExitCode::FAILURE
-        }
+    let Err(err) = result else {
+        return ExitCode::SUCCESS;
+    };
+    #[cfg(windows)]
+    win_console::attach_parent();
+    if started.load(std::sync::atomic::Ordering::SeqCst) {
+        eprintln!("rexeditor: the graphical window closed unexpectedly: {err}");
+        return ExitCode::FAILURE;
     }
+    eprintln!("rexeditor: could not start the graphical window: {err}");
+    #[cfg(feature = "tui")]
+    {
+        eprintln!("rexeditor: falling back to the terminal UI");
+        run_tui(fallback)
+    }
+    #[cfg(not(feature = "tui"))]
+    ExitCode::FAILURE
 }
 
 #[cfg(not(feature = "gui"))]

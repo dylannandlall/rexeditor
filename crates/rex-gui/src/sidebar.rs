@@ -159,10 +159,7 @@ fn copyable_value(ui: &mut egui::Ui, display: &str) -> egui::Response {
 }
 
 fn copy_to_clipboard(ui: &egui::Ui, text: &str) {
-    ui.ctx().copy_text(text.to_string());
-    if let Ok(mut cb) = arboard::Clipboard::new() {
-        let _ = cb.set_text(text.to_string());
-    }
+    crate::clipboard::copy(ui.ctx(), text);
 }
 
 fn format_numeric(data: &InspectorData, kind: &str, endian: Endianness) -> String {
