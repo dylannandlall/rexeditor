@@ -14,7 +14,8 @@ use super::{App, Column, Focus, HexGeometry, Tab};
 
 const PANEL_MIN_W: u16 = 36;
 const PANEL_MAX_W: u16 = 48;
-const AUTO_BPR: [usize; 5] = [32, 24, 16, 8, 4];
+/// Bytes per row tried when fitting to the terminal; 16 is the default, and wider rows are manual.
+const AUTO_BPR: [usize; 3] = [16, 8, 4];
 
 pub struct FrameLayout {
     pub tabs: Rect,
@@ -56,7 +57,7 @@ pub fn compute_layout(app: &App, area: Rect) -> FrameLayout {
         Some(m) => (m, app.show_panel && fits(m, with_panel)),
         None => {
             let wide = if app.show_panel {
-                AUTO_BPR[..3].iter().copied().find(|&b| fits(b, with_panel))
+                AUTO_BPR[..1].iter().copied().find(|&b| fits(b, with_panel))
             } else {
                 None
             };
@@ -783,7 +784,14 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
 fn render_hint(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(prompt) = &app.prompt {
         let label = format!("{}: ", prompt.kind.label());
+        let candidates = if prompt.candidates.is_empty() {
+            String::new()
+        } else {
+            format!("   [{}]", prompt.candidates.join("  "))
+        };
         let hint = match prompt.kind {
+            _ if !candidates.is_empty() => candidates.as_str(),
+            super::PromptKind::Open | super::PromptKind::SaveAs => "   (Tab completes path)",
             super::PromptKind::Search => {
                 "   (hex DE AD ?? · text:abc · itext: · utf16le: · u32le:123 · re:[A-Z]+ · empty clears)"
             }
@@ -985,7 +993,7 @@ mod tests {
         assert_eq!(narrow.geometry.bpr, 8);
 
         let huge = compute_layout(&app, Rect::new(0, 0, 250, 30));
-        assert_eq!(huge.geometry.bpr, 32);
+        assert_eq!(huge.geometry.bpr, 16, "auto-fit never goes wider than 16");
 
         app.show_panel = false;
         assert!(

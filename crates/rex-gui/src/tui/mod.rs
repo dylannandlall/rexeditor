@@ -261,6 +261,79 @@ impl LineInput {
 pub struct Prompt {
     pub kind: PromptKind,
     pub input: LineInput,
+    /// Path completions offered by the last ambiguous Tab press.
+    pub candidates: Vec<String>,
+}
+
+/// Result of completing a path the way a shell does.
+#[derive(Debug, PartialEq, Eq)]
+struct PathCompletion {
+    /// The input with the longest common prefix of all matches filled in.
+    text: String,
+    /// Names of every match (directories end in `/`), sorted.
+    matches: Vec<String>,
+}
+
+/// Completes the last path component of `input` against the file system: `~` expands to the
+/// home directory, directories get a trailing `/`, and dotfiles only match a `.` prefix.
+fn complete_path(input: &str) -> PathCompletion {
+    // A bare `~` completes to `~/`.
+    if input == "~" {
+        return PathCompletion {
+            text: "~/".into(),
+            matches: Vec::new(),
+        };
+    }
+    let split = input.rfind('/').map_or(0, |i| i + 1);
+    let (dir_part, name_part) = input.split_at(split);
+    let dir = if dir_part.is_empty() {
+        PathBuf::from(".")
+    } else if let Some(rest) = dir_part.strip_prefix('~') {
+        match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            Some(home) => PathBuf::from(home).join(rest.trim_start_matches('/')),
+            None => PathBuf::from(dir_part),
+        }
+    } else {
+        PathBuf::from(dir_part)
+    };
+    let unchanged = PathCompletion {
+        text: input.to_string(),
+        matches: Vec::new(),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return unchanged;
+    };
+    let mut matches: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let mut name = e.file_name().into_string().ok()?;
+            if !name.starts_with(name_part) || (name.starts_with('.') && !name_part.starts_with('.')) {
+                return None;
+            }
+            if e.path().is_dir() {
+                name.push('/');
+            }
+            Some(name)
+        })
+        .collect();
+    matches.sort();
+    let Some(first) = matches.first() else {
+        return unchanged;
+    };
+    let mut common = first.clone();
+    for m in &matches[1..] {
+        let n = common
+            .chars()
+            .zip(m.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| a.len_utf8())
+            .sum();
+        common.truncate(n);
+    }
+    PathCompletion {
+        text: format!("{dir_part}{common}"),
+        matches,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -894,6 +967,7 @@ impl App {
         self.prompt = Some(Prompt {
             kind,
             input: LineInput::with_text(initial),
+            candidates: Vec::new(),
         });
     }
 
@@ -907,7 +981,22 @@ impl App {
                 let prompt = self.prompt.take().expect("prompt is open");
                 self.submit_prompt(prompt.kind, prompt.input.text.trim().to_string());
             }
+            KeyCode::Tab
+                if matches!(prompt.kind, PromptKind::Open | PromptKind::SaveAs)
+                    && prompt.input.cursor == prompt.input.text.chars().count() =>
+            {
+                let done = complete_path(&prompt.input.text);
+                let grew = done.text != prompt.input.text;
+                prompt.input = LineInput::with_text(done.text);
+                // Like bash: list the options once completion can go no further.
+                prompt.candidates = if grew || done.matches.len() < 2 {
+                    Vec::new()
+                } else {
+                    done.matches
+                };
+            }
             _ => {
+                prompt.candidates.clear();
                 prompt.input.handle_key(key);
             }
         }
@@ -1598,6 +1687,39 @@ mod tests {
         assert_eq!(input.text, "123");
         input.insert_str("é\n");
         assert_eq!(input.text, "é123", "control characters are dropped");
+    }
+
+    #[test]
+    fn path_completion_fills_common_prefix_and_lists_matches() {
+        let dir = std::env::temp_dir().join(format!("rex-complete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in ["alpha.bin", "alpine.bin", "beta.bin", ".hidden"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let base = format!("{}/", dir.display());
+
+        let done = complete_path(&format!("{base}be"));
+        assert_eq!(done.text, format!("{base}beta.bin"));
+        let done = complete_path(&format!("{base}al"));
+        assert_eq!(done.text, format!("{base}alp"), "fills the common prefix");
+        assert_eq!(done.matches, ["alpha.bin", "alpine.bin"]);
+        let done = complete_path(&format!("{base}s"));
+        assert_eq!(done.text, format!("{base}sub/"), "directories get a slash");
+        let done = complete_path(&base);
+        assert!(!done.matches.contains(&".hidden".to_string()));
+        let done = complete_path(&format!("{base}."));
+        assert_eq!(done.text, format!("{base}.hidden"));
+        let done = complete_path(&format!("{base}zzz"));
+        assert_eq!(done.text, format!("{base}zzz"));
+
+        let mut app = App::new(LaunchOptions::default());
+        app.open_prompt(PromptKind::Open, format!("{base}alp"));
+        app.handle_key(key(KeyCode::Tab));
+        let prompt = app.prompt.as_ref().unwrap();
+        assert_eq!(prompt.input.text, format!("{base}alp"));
+        assert_eq!(prompt.candidates.len(), 2, "second stop lists options");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
