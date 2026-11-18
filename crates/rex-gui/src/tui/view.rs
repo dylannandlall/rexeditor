@@ -1183,7 +1183,7 @@ mod tests {
         );
         assert_eq!(
             binary_lines(&[0xAA; 9], 80),
-            vec![format!("{} …", vec!["10101010"; 8].join(" "))]
+            vec![format!("{} …", ["10101010"; 8].join(" "))]
         );
     }
 
