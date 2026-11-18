@@ -9,11 +9,14 @@
 compile_error!("rexeditor needs at least one front end: enable the `gui` and/or `tui` feature");
 
 mod cli;
+mod paths;
 
 #[cfg(feature = "gui")]
 mod app;
 #[cfg(feature = "gui")]
 mod clipboard;
+#[cfg(feature = "gui")]
+mod file_picker;
 #[cfg(feature = "gui")]
 mod hex_viewport;
 #[cfg(feature = "gui")]

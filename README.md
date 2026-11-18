@@ -97,6 +97,12 @@ dialogs, and handles the clipboard in pure Rust. **No `-dev` C header packages (
 `libgtk-3-dev` or `libx11-dev`) are needed to build it.** At runtime the GUI needs a working X11
 or Wayland session with OpenGL; the terminal UI needs only a terminal.
 
+File dialogs use the XDG Desktop Portal, or `zenity` when no portal is running. Where neither is
+available (for example a stock WSL2 install), Open / Save As / overlay dialogs use a built-in
+picker instead: type a path with live autocomplete (Tab completes, Up/Down choose, Enter opens).
+Install `zenity` (`sudo apt install zenity`) to get the system dialog, or set
+`REXEDITOR_BUILTIN_FILE_PICKER=1` to always use the built-in one.
+
 ### Terminal-only build
 
 To build without any GUI dependencies (eframe, winit, OpenGL, X11/Wayland), for example for a

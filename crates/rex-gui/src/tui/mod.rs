@@ -11,7 +11,6 @@
 mod view;
 
 use std::io;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{
@@ -27,6 +26,7 @@ use rex_core::{
 };
 
 use crate::cli::{LaunchOptions, apply_offset_with_bounds_notice};
+use crate::paths::{complete_path, expand_path};
 
 /// Which column keyboard edits go to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -263,77 +263,6 @@ pub struct Prompt {
     pub input: LineInput,
     /// Path completions offered by the last ambiguous Tab press.
     pub candidates: Vec<String>,
-}
-
-/// Result of completing a path the way a shell does.
-#[derive(Debug, PartialEq, Eq)]
-struct PathCompletion {
-    /// The input with the longest common prefix of all matches filled in.
-    text: String,
-    /// Names of every match (directories end in `/`), sorted.
-    matches: Vec<String>,
-}
-
-/// Completes the last path component of `input` against the file system: `~` expands to the
-/// home directory, directories get a trailing `/`, and dotfiles only match a `.` prefix.
-fn complete_path(input: &str) -> PathCompletion {
-    // A bare `~` completes to `~/`.
-    if input == "~" {
-        return PathCompletion {
-            text: "~/".into(),
-            matches: Vec::new(),
-        };
-    }
-    let split = input.rfind('/').map_or(0, |i| i + 1);
-    let (dir_part, name_part) = input.split_at(split);
-    let dir = if dir_part.is_empty() {
-        PathBuf::from(".")
-    } else if let Some(rest) = dir_part.strip_prefix('~') {
-        match std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-            Some(home) => PathBuf::from(home).join(rest.trim_start_matches('/')),
-            None => PathBuf::from(dir_part),
-        }
-    } else {
-        PathBuf::from(dir_part)
-    };
-    let unchanged = PathCompletion {
-        text: input.to_string(),
-        matches: Vec::new(),
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return unchanged;
-    };
-    let mut matches: Vec<String> = entries
-        .flatten()
-        .filter_map(|e| {
-            let mut name = e.file_name().into_string().ok()?;
-            if !name.starts_with(name_part) || (name.starts_with('.') && !name_part.starts_with('.')) {
-                return None;
-            }
-            if e.path().is_dir() {
-                name.push('/');
-            }
-            Some(name)
-        })
-        .collect();
-    matches.sort();
-    let Some(first) = matches.first() else {
-        return unchanged;
-    };
-    let mut common = first.clone();
-    for m in &matches[1..] {
-        let n = common
-            .chars()
-            .zip(m.chars())
-            .take_while(|(a, b)| a == b)
-            .map(|(a, _)| a.len_utf8())
-            .sum();
-        common.truncate(n);
-    }
-    PathCompletion {
-        text: format!("{dir_part}{common}"),
-        matches,
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1008,7 +937,7 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
-                let path = PathBuf::from(&text);
+                let path = expand_path(&text);
                 match Document::open(path.clone()) {
                     Ok(doc) => {
                         self.tabs.push(Tab::new(doc));
@@ -1053,7 +982,7 @@ impl App {
                     return;
                 }
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    match tab.doc.save_as(PathBuf::from(&text)) {
+                    match tab.doc.save_as(expand_path(&text)) {
                         Ok(()) => tab.doc.status = format!("Saved as {text}"),
                         Err(err) => tab.doc.status = format!("Save failed: {err}"),
                     }

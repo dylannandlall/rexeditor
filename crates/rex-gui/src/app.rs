@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -9,6 +9,7 @@ use std::{
 
 use egui::{Color32, Context, Key, RichText};
 use crate::cli::{LaunchOptions, apply_offset_with_bounds_notice};
+use crate::file_picker::{FilePicker, PickerOutcome, PickerPurpose, SYSTEM_DIALOG_MIN_HUMAN_TIME};
 use rex_core::{
     ByteColorMode, CopyFormat, Document, EditKind, SearchMatch, Selection,
     entropy::{self, EntropyMessage, EntropyReport, EntropyWorker},
@@ -320,6 +321,10 @@ pub struct RexEditorApp {
     style_initialized: bool,
     /// Modifier keys held at the end of the previous frame (see `copy_shortcut_format`).
     prev_modifiers: egui::Modifiers,
+    /// Built-in file picker, shown when no system file dialog is available.
+    file_picker: Option<FilePicker>,
+    /// Whether to try the system (rfd) file dialog first.
+    system_dialogs: bool,
 }
 
 impl RexEditorApp {
@@ -383,6 +388,8 @@ impl RexEditorApp {
             status_banner,
             style_initialized: false,
             prev_modifiers: egui::Modifiers::NONE,
+            file_picker: None,
+            system_dialogs: crate::file_picker::system_dialog_available(),
         }
     }
 
@@ -475,13 +482,75 @@ impl RexEditorApp {
         }
     }
 
+    /// Runs a system file dialog. Returns `None` when no dialog could be shown, so the
+    /// caller should use the built-in picker. `rfd` reports a missing dialog backend the
+    /// same way as Cancel, so an answer faster than a person could give counts as missing.
+    fn system_dialog<T>(&mut self, run: impl FnOnce() -> Option<T>) -> Option<Option<T>> {
+        if !self.system_dialogs {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let result = run();
+        if result.is_none() && started.elapsed() < SYSTEM_DIALOG_MIN_HUMAN_TIME {
+            self.system_dialogs = false;
+            return None;
+        }
+        Some(result)
+    }
+
+    /// Folder the built-in picker starts in: the active file's folder, else the
+    /// current directory.
+    fn picker_start_dir(&self) -> PathBuf {
+        self.tabs
+            .get(self.active_tab)
+            .and_then(|t| std::fs::canonicalize(&t.doc.path).ok())
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/"))
+    }
+
     pub fn open_file_dialog(&mut self) {
-        if let Some(paths) = rfd::FileDialog::new()
-            .set_title("Open Binary File")
-            .pick_files()
-        {
-            for path in paths {
-                self.open_path(path);
+        match self.system_dialog(|| {
+            // A zenity that fails to start yields an empty list rather than None.
+            rfd::FileDialog::new()
+                .set_title("Open Binary File")
+                .pick_files()
+                .filter(|paths| !paths.is_empty())
+        }) {
+            Some(Some(paths)) => {
+                for path in paths {
+                    self.open_path(path);
+                }
+            }
+            Some(None) => {}
+            None => {
+                let dir = self.picker_start_dir();
+                self.file_picker = Some(FilePicker::new(PickerPurpose::OpenBinary, &dir, None));
+            }
+        }
+    }
+
+    /// Carries out the action the built-in picker was opened for.
+    fn apply_picked_file(&mut self, purpose: PickerPurpose, path: PathBuf) {
+        if purpose == PickerPurpose::OpenBinary {
+            self.open_path(path);
+            return;
+        }
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else {
+            return;
+        };
+        match purpose {
+            PickerPurpose::OpenBinary => {}
+            PickerPurpose::SaveBinaryAs => {
+                if let Err(err) = tab.doc.save_as(path) {
+                    self.status_banner = err;
+                }
+            }
+            PickerPurpose::LoadOverlay => {
+                tab.doc.status = tab.doc.load_overlay_from(&path).unwrap_or_else(|e| e);
+            }
+            PickerPurpose::SaveOverlayAs => {
+                tab.doc.status = tab.doc.save_overlay_to(&path).unwrap_or_else(|e| e);
             }
         }
     }
@@ -506,18 +575,27 @@ impl RexEditorApp {
         let Some(tab) = self.tabs.get_mut(self.active_tab) else {
             return;
         };
-        if save_as || !tab.doc.path.is_file() {
-            if let Some(path) = rfd::FileDialog::new()
-                .set_title("Save Binary As")
-                .set_file_name(tab.doc.file_name())
-                .save_file()
-            {
-                if let Err(err) = tab.doc.save_as(path) {
-                    self.status_banner = err;
-                }
+        if !save_as && tab.doc.path.is_file() {
+            if let Err(err) = tab.doc.save() {
+                self.status_banner = err;
             }
-        } else if let Err(err) = tab.doc.save() {
-            self.status_banner = err;
+            return;
+        }
+        let name = tab.doc.file_name();
+        let chosen = self.system_dialog(|| {
+            rfd::FileDialog::new()
+                .set_title("Save Binary As")
+                .set_file_name(&name)
+                .save_file()
+        });
+        match chosen {
+            Some(Some(path)) => self.apply_picked_file(PickerPurpose::SaveBinaryAs, path),
+            Some(None) => {}
+            None => {
+                let dir = self.picker_start_dir();
+                self.file_picker =
+                    Some(FilePicker::new(PickerPurpose::SaveBinaryAs, &dir, Some(&name)));
+            }
         }
     }
 
@@ -525,15 +603,17 @@ impl RexEditorApp {
         if self.tabs.is_empty() {
             return;
         }
-        if let Some(path) = rfd::FileDialog::new()
-            .set_title("Load Overlay JSON")
-            .add_filter("JSON Overlay", &["json"])
-            .pick_file()
-            && let Some(tab) = self.tabs.get_mut(self.active_tab)
-        {
-            match tab.doc.load_overlay_from(&path) {
-                Ok(msg) => tab.doc.status = msg,
-                Err(err) => tab.doc.status = err,
+        match self.system_dialog(|| {
+            rfd::FileDialog::new()
+                .set_title("Load Overlay JSON")
+                .add_filter("JSON Overlay", &["json"])
+                .pick_file()
+        }) {
+            Some(Some(path)) => self.apply_picked_file(PickerPurpose::LoadOverlay, path),
+            Some(None) => {}
+            None => {
+                let dir = self.picker_start_dir();
+                self.file_picker = Some(FilePicker::new(PickerPurpose::LoadOverlay, &dir, None));
             }
         }
     }
@@ -546,21 +626,28 @@ impl RexEditorApp {
         else {
             return;
         };
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Save Overlay JSON As")
-            .add_filter("JSON Overlay", &["json"]);
-        if let Some(dir) = suggested.parent() {
-            dialog = dialog.set_directory(dir);
-        }
-        if let Some(name) = suggested.file_name() {
-            dialog = dialog.set_file_name(name.to_string_lossy());
-        }
-        if let Some(path) = dialog.save_file()
-            && let Some(tab) = self.tabs.get_mut(self.active_tab)
-        {
-            match tab.doc.save_overlay_to(&path) {
-                Ok(msg) => tab.doc.status = msg,
-                Err(err) => tab.doc.status = err,
+        let dir = suggested
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.picker_start_dir());
+        let name = suggested
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let chosen = self.system_dialog(|| {
+            rfd::FileDialog::new()
+                .set_title("Save Overlay JSON As")
+                .add_filter("JSON Overlay", &["json"])
+                .set_directory(&dir)
+                .set_file_name(&name)
+                .save_file()
+        });
+        match chosen {
+            Some(Some(path)) => self.apply_picked_file(PickerPurpose::SaveOverlayAs, path),
+            Some(None) => {}
+            None => {
+                self.file_picker =
+                    Some(FilePicker::new(PickerPurpose::SaveOverlayAs, &dir, Some(&name)));
             }
         }
     }
@@ -1132,7 +1219,9 @@ impl eframe::App for RexEditorApp {
             ctx.request_repaint_after(Duration::from_millis(32));
         }
 
-        self.handle_keyboard_shortcuts(ctx);
+        if self.file_picker.is_none() {
+            self.handle_keyboard_shortcuts(ctx);
+        }
         self.prev_modifiers = ctx.input(|i| i.modifiers);
 
         // ---- Top Menu & Workstation Toolbar ----
@@ -2141,6 +2230,19 @@ impl eframe::App for RexEditorApp {
                 self.help_modal_open = open;
             }
         }
+
+        // ---- Built-in file picker (no system file dialog available) ----
+        if let Some(picker) = &mut self.file_picker {
+            match picker.show(ctx) {
+                PickerOutcome::Pending => {}
+                PickerOutcome::Cancelled => self.file_picker = None,
+                PickerOutcome::Chosen(path) => {
+                    let purpose = picker.purpose;
+                    self.file_picker = None;
+                    self.apply_picked_file(purpose, path);
+                }
+            }
+        }
     }
 }
 
@@ -2294,6 +2396,35 @@ fn render_help_contents(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instant_dialog_failure_switches_to_the_builtin_picker() {
+        let mut app = RexEditorApp::new(Vec::new());
+        app.system_dialogs = true;
+        // A real Cancel takes a person longer than the threshold.
+        let cancelled = app.system_dialog(|| {
+            std::thread::sleep(SYSTEM_DIALOG_MIN_HUMAN_TIME + Duration::from_millis(20));
+            None::<PathBuf>
+        });
+        assert_eq!(cancelled, Some(None));
+        assert!(app.system_dialogs);
+        // A dialog that "returns" instantly never appeared.
+        assert_eq!(app.system_dialog(|| None::<PathBuf>), None);
+        assert!(!app.system_dialogs);
+        // From then on the system dialog isn't tried at all.
+        assert_eq!(app.system_dialog(|| -> Option<PathBuf> { panic!("not called") }), None);
+
+        app.system_dialogs = true;
+        assert_eq!(app.system_dialog(|| Some(PathBuf::from("x"))), Some(Some(PathBuf::from("x"))));
+    }
+
+    #[test]
+    fn open_without_system_dialog_shows_the_builtin_picker() {
+        let mut app = RexEditorApp::new(Vec::new());
+        app.system_dialogs = false;
+        app.open_file_dialog();
+        assert_eq!(app.file_picker.as_ref().map(|p| p.purpose), Some(PickerPurpose::OpenBinary));
+    }
 
     #[test]
     fn copy_shortcuts_pick_compact_hex_by_default() {
